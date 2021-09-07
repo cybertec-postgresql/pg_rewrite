@@ -1,0 +1,10 @@
+CatalogState
+ConcurrentChange
+ConcurrentChangeKind
+ConstraintInfo
+DecodingOutputState
+IndexCatInfo
+PartitionEntry
+PgClassCatInfo
+TypeCatInfo
+partitions_hash
