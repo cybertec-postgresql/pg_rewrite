@@ -13,6 +13,9 @@
 #include "access/multixact.h"
 #include "access/sysattr.h"
 #include "access/tupdesc_details.h"
+#if PG_VERSION_NUM >= 150000
+#include "access/xloginsert.h"
+#endif
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
 #include "catalog/heap.h"
@@ -90,6 +93,10 @@ typedef struct ConstraintInfo
 	Oid			pf_eq_oprs[INDEX_MAX_KEYS];
 	Oid			pp_eq_oprs[INDEX_MAX_KEYS];
 	Oid			ff_eq_oprs[INDEX_MAX_KEYS];
+#if PG_VERSION_NUM >= 150000
+	int			num_fk_del_set_cols;
+	AttrNumber	fk_del_set_cols[INDEX_MAX_KEYS];
+#endif
 } ConstraintInfo;
 
 static void check_prerequisites(Relation rel);
@@ -725,7 +732,11 @@ partition_table_internal(PG_FUNCTION_ARGS)
 	 * Since we'll do some more changes, all the WAL records flushed so far
 	 * need to be decoded for sure.
 	 */
+#if PG_VERSION_NUM >= 150000
+	end_of_wal = GetFlushRecPtr(NULL);
+#else
 	end_of_wal = GetFlushRecPtr();
+#endif
 
 	/*
 	 * Decode and apply the data changes that occurred while the initial load
@@ -1909,6 +1920,17 @@ fk_comparator(ConstraintInfo *c1, ConstraintInfo *c2, char kind)
 			return false;
 	}
 
+#if PG_VERSION_NUM >= 150000
+	if (c1->num_fk_del_set_cols != c2->num_fk_del_set_cols)
+		return false;
+
+	for (i = 0; i < c1->num_fk_del_set_cols; i++)
+	{
+		if (c1->fk_del_set_cols[i] != c2->fk_del_set_cols[i])
+			return false;
+	}
+#endif
+
 	return true;
 }
 
@@ -2104,7 +2126,12 @@ get_relation_constraints(Relation rel, int *ncheck, int *nunique, int *nfk)
 									   info->confkey,
 									   info->pf_eq_oprs,
 									   info->pp_eq_oprs,
-									   info->ff_eq_oprs);
+									   info->ff_eq_oprs
+#if PG_VERSION_NUM >= 150000
+									   ,&info->num_fk_del_set_cols,
+									   info->fk_del_set_cols
+#endif
+				);
 			(*nfk)++;
 		}
 		else
@@ -3060,7 +3087,11 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 		 * Note that the insertions into the new table shouldn't actually be
 		 * decoded, they should be filtered out by their origin.
 		 */
+#if PG_VERSION_NUM >= 150000
+		end_of_wal = GetFlushRecPtr(NULL);
+#else
 		end_of_wal = GetFlushRecPtr();
+#endif
 		if (end_of_wal > end_of_wal_prev)
 		{
 			MemoryContextSwitchTo(old_cxt);
@@ -3275,7 +3306,11 @@ perform_final_merge(EState *estate,
 	XLogRegisterData(&dummy_rec_data, 1);
 	xlog_insert_ptr = XLogInsert(RM_XLOG_ID, XLOG_NOOP);
 	XLogFlush(xlog_insert_ptr);
+#if PG_VERSION_NUM >= 150000
+	end_of_wal = GetFlushRecPtr(NULL);
+#else
 	end_of_wal = GetFlushRecPtr();
+#endif
 
 	/*
 	 * Process the changes that might have taken place while we were waiting
