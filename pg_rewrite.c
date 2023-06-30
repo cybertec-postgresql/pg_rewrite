@@ -3,7 +3,7 @@
  * pg_rewrite.c
  *     Tools for maintenance that requires table rewriting.
  *
- * Copyright (c) 2021, Cybertec PostgreSQL International GmbH
+ * Copyright (c) 2021-2023, Cybertec PostgreSQL International GmbH
  *
  *------------------------------------------------------------
  */
