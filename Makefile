@@ -5,6 +5,7 @@ PGFILEDESC = "pg_rewrite - tools for maintenance that requires table rewriting."
 
 EXTENSION = pg_rewrite
 DATA = pg_rewrite--1.0.sql
+DOCS = pg_rewrite.md
 
 REGRESS = main
 REGRESS_OPTS = "--schedule=parallel_schedule"
