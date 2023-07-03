@@ -1,0 +1,29 @@
+Source: pg-rewrite
+Section: database
+Priority: optional
+Maintainer: CYBERTEC PostgreSQL <office@cybertec.at>
+Uploaders:
+ Christoph Berg <myon@debian.org>,
+Build-Depends:
+ debhelper-compat (= 13),
+ postgresql-all (>= 217~),
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://www.cybertec-postgresql.com/en/
+Vcs-Browser: https://github.com/cybertec-postgresql/pg_rewrite
+Vcs-Git: https://github.com/cybertec-postgresql/pg_rewrite.git
+
+Package: postgresql-PGVERSION-rewrite
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${postgresql:Depends},
+ ${shlibs:Depends},
+Description: Track failed PostgreSQL login attempts, and lockout users
+ Track failed PostgreSQL login attempts, such as due to password mismatch, and
+ lock out automatically users to prevent brute-force attacks. Each unauthorized
+ access attempt gets recorded within the log table. If the number of
+ unsuccessful access attempts exceeds the specified limit (pg_rewrite.limit)
+ within the specified period (pg_rewrite.period), the user gets locked out of
+ this database cluster. It cannot record access attempts that match reject
+ entries in pg_hba.conf, as that would require patching the server.
