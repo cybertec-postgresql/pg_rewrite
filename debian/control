@@ -19,11 +19,8 @@ Depends:
  ${misc:Depends},
  ${postgresql:Depends},
  ${shlibs:Depends},
-Description: Track failed PostgreSQL login attempts, and lockout users
- Track failed PostgreSQL login attempts, such as due to password mismatch, and
- lock out automatically users to prevent brute-force attacks. Each unauthorized
- access attempt gets recorded within the log table. If the number of
- unsuccessful access attempts exceeds the specified limit (pg_rewrite.limit)
- within the specified period (pg_rewrite.period), the user gets locked out of
- this database cluster. It cannot record access attempts that match reject
- entries in pg_hba.conf, as that would require patching the server.
+Description: Perform maintenance tasks which require a table to be rewritten
+ pg_rewrite aims to be a set of tools to perform maintenance tasks which
+ require a table to be rewritten (i.e. the table data to be copied to a new
+ storage) and which are expected to limit the access to the table as little as
+ possible.
