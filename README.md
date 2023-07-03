@@ -13,7 +13,7 @@ version 13 or later is required.
 
 ```bash
 git clone https://github.com/cybertec-postgresql/pg_rewrite.git
-cd pg_squeeze
+cd pg_rewrite
 make
 make install
 ```
