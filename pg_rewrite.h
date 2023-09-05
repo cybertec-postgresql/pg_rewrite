@@ -3,7 +3,7 @@
  * pg_rewrite.h
  *     Tools for maintenance that requires table rewriting.
  *
- * Copyright (c) 2021, Cybertec PostgreSQL International GmbH
+ * Copyright (c) 2023, Cybertec PostgreSQL International GmbH
  *
  *------------------------------------------------------------
  */
@@ -217,6 +217,10 @@ typedef struct PartitionEntry
 #define SH_DECLARE
 #define SH_DEFINE
 #include "lib/simplehash.h"
+
+extern PGDLLEXPORT void rewrite_worker_main(Datum main_arg);
+
+extern void pg_rewrite_exit_if_requested(void);
 
 /*
  * Use function names distinct from those in pg_squeeze, in case both

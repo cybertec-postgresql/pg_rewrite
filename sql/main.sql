@@ -8,7 +8,7 @@ FROM generate_series(0, 1023) g(i);
 
 CREATE TABLE tab1(i int PRIMARY KEY REFERENCES pk, j int, k int);
 -- If a dropped column is encountered, the source tuple should be converted
--- co it matches the destination table.
+-- so it matches the destination table.
 ALTER TABLE tab1 DROP COLUMN k;
 ALTER TABLE tab1 ADD COLUMN k int;
 INSERT INTO tab1(i, j, k)

@@ -2,7 +2,7 @@ DROP EXTENSION IF EXISTS pg_rewrite;
 
 CREATE TABLE tbl_src(i int primary key, j int);
 -- Test that the source and destination tuple descriptors do not have to be
--- exactly the same.
+-- exactly the same (e.g. dropped column may exist).
 ALTER TABLE tbl_src DROP COLUMN j;
 ALTER TABLE tbl_src ADD COLUMN j int;
 INSERT INTO tbl_src(i, j) VALUES (1, 1), (4, 4);

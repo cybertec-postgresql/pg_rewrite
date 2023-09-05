@@ -3,11 +3,15 @@
  * pg_rewrite.c
  *     Tools for maintenance that requires table rewriting.
  *
- * Copyright (c) 2021, Cybertec PostgreSQL International GmbH
+ * Copyright (c) 2023, Cybertec PostgreSQL International GmbH
  *
  *------------------------------------------------------------
  */
 #include "pg_rewrite.h"
+
+#if PG_VERSION_NUM < 130000
+#error "PostgreSQL version 13 or higher is required"
+#endif
 
 #include "access/heaptoast.h"
 #include "access/multixact.h"
@@ -30,6 +34,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
+#include "commands/dbcommands.h"
 #include "commands/extension.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -43,6 +48,7 @@
 #include "partitioning/partdesc.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
+#include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
@@ -59,16 +65,14 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
-#if PG_VERSION_NUM < 130000
-#error "PostgreSQL version 13 or higher is required"
-#endif
-
 PG_MODULE_MAGIC;
 
 #define	REPL_SLOT_BASE_NAME	"pg_rewrite_slot_"
 #define	REPL_PLUGIN_NAME	"pg_rewrite"
 
-static void partition_table_internal(PG_FUNCTION_ARGS);
+static void partition_table_impl(Oid dbid, Oid roleid, char *relschema_src,
+								 char *relname_src, char *relname_src_new,
+								 char *relschema_dst, char *relname_dst);
 static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* The WAL segment being decoded. */
@@ -98,6 +102,10 @@ typedef struct ConstraintInfo
 	AttrNumber	fk_del_set_cols[INDEX_MAX_KEYS];
 #endif
 } ConstraintInfo;
+
+static void worker_shmem_request(void);
+static void worker_shmem_startup(void);
+static void worker_shmem_shutdown(int code, Datum arg);
 
 static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
@@ -181,9 +189,28 @@ int			rewrite_max_xlock_time = 0;
  */
 int			rewrite_wait_after_load = 0;
 
+#if PG_VERSION_NUM >= 150000
+shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
+shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
 void
 _PG_init(void)
 {
+	if (!process_shared_preload_libraries_in_progress)
+		ereport(ERROR,
+				(errmsg("pg_rewrite must be loaded via shared_preload_libraries")));
+
+#if PG_VERSION_NUM >= 150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = worker_shmem_request;
+#else
+	worker_shmem_request();
+#endif
+
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = worker_shmem_startup;
+
 	DefineCustomBoolVariable("rewrite.check_constraints",
 							 "Should constraints on the destination table be checked?",
 							 "Should it be checked whether constraints on the destination table match those "
@@ -220,54 +247,150 @@ _PG_init(void)
 #define REPLORIGIN_NAME_PATTERN	"pg_rewrite_%u"
 
 /*
- * SQL interface to partition one table interactively.
+ * The original implementation would certainly fail on PG 16 and higher, due
+ * to the commit 240e0dbacd (in the master branch) - this commit makes it
+ * impossible to invoke our functionality via the PG executor. It's not worth
+ * supporting lower versions of pg_rewrite on lower versions of PG server.
  */
 extern Datum partition_table(PG_FUNCTION_ARGS);
-
 PG_FUNCTION_INFO_V1(partition_table);
 Datum
 partition_table(PG_FUNCTION_ARGS)
 {
-	PG_TRY();
-	{
-		partition_table_internal(fcinfo);
-	}
-	PG_CATCH();
-	{
-		/*
-		 * Special effort is needed to release the replication slot because,
-		 * unlike other resources, AbortTransaction() does not release it.
-		 * While the transaction is aborted if an ERROR is caught in the main
-		 * loop of postgres.c, it would not do if the ERROR was trapped at
-		 * lower level in the stack. The typical case is that
-		 * partition_table() is called from pl/pgsql function.
-		 */
-		if (MyReplicationSlot != NULL)
-			ReplicationSlotRelease();
-
-		/*
-		 * There seems to be no automatic cleanup of the origin, so do it
-		 * here.
-		 */
-		if (replorigin_session_origin != InvalidRepOriginId)
-		{
-#if PG_VERSION_NUM >= 140000
-			char		replorigin_name[255];
-
-			snprintf(replorigin_name, sizeof(replorigin_name),
-					 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
-			replorigin_drop_by_name(replorigin_name, false, true);
-#else
-			replorigin_drop(replorigin_session_origin, false);
-#endif
-			replorigin_session_origin = InvalidRepOriginId;
-		}
-
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+	ereport(ERROR, (errmsg("the old implementation of the function is no longer supported"),
+					errhint("please run \"ALTER EXTENSION pg_rewrite UPDATE\"")));
 
 	PG_RETURN_VOID();
+}
+
+/*
+ * The new implementation, which delegates the execution to a background
+ * worker (as opposed to the PG executor).
+ *
+ * Arguments are passed to the worker via this structure, located in the
+ * shared memory.
+ */
+typedef struct WorkerTask
+{
+	/* Connection info. */
+	Oid		dbid;
+	Oid		roleid;
+
+	/* Backend that performs the task both sets and clears this field. */
+	pid_t		pid;
+
+	/* See the comments of pg_rewrite_exit_if_requested(). */
+	bool	exit_requested;
+
+	/*
+	 * Use this when setting / clearing the fields above. Once dbid is set,
+	 * the task belongs to the backend that set it, so the other fields may be
+	 * assigned w/o the lock.
+	 */
+	slock_t		mutex;
+
+	/* The tables to work on. */
+	NameData	relschema_src;
+	NameData	relname_src;
+	NameData	relname_src_new;
+	NameData	relschema_dst;
+	NameData	relname_dst;
+
+	/* Space for the worker to send an error message to the backend. */
+#define	MAX_ERR_MSG_LEN	1024
+	char		msg[MAX_ERR_MSG_LEN];
+
+	/* The rewrite.wait_after_load GUC, for test purposes. */
+	int		wait_after_load;
+	/* The rewrite.check_constraints GUC, for test purposes. */
+	bool	check_constraints;
+} WorkerTask;
+
+#define		MAX_TASKS	1
+
+/* Pointer to task array in the shared memory, available in all backends. */
+static WorkerTask	*workerTasks = NULL;
+
+/* Each backend stores here the pointer to its task in the shared memory. */
+static WorkerTask *MyWorkerTask = NULL;
+
+static void
+interrupt_worker(WorkerTask *task)
+{
+	SpinLockAcquire(&task->mutex);
+	task->exit_requested = true;
+	SpinLockRelease(&task->mutex);
+}
+
+static void
+release_task(WorkerTask *task)
+{
+	SpinLockAcquire(&task->mutex);
+	Assert(task->dbid != InvalidOid);
+	task->dbid = InvalidOid;
+	SpinLockRelease(&task->mutex);
+}
+
+static Size
+worker_shmem_size(void)
+{
+	return MAX_TASKS * sizeof(WorkerTask);
+}
+
+static void
+worker_shmem_request(void)
+{
+	/* With lower PG versions this function is called from _PG_init(). */
+#if PG_VERSION_NUM >= 150000
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+#endif	/* PG_VERSION_NUM >= 150000 */
+
+	RequestAddinShmemSpace(worker_shmem_size());
+}
+
+static void
+worker_shmem_startup(void)
+{
+	bool		found;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	workerTasks = ShmemInitStruct("pg_rewrite",
+								  worker_shmem_size(),
+								  &found);
+	if (!found)
+	{
+		int		i;
+
+		for (i = 0; i < MAX_TASKS; i++)
+		{
+			WorkerTask *task = &workerTasks[i];
+
+			task->dbid = InvalidOid;
+			task->roleid = InvalidOid;
+			task->pid = InvalidPid;
+			task->exit_requested = false;
+			SpinLockInit(&task->mutex);
+		}
+	}
+
+	LWLockRelease(AddinShmemInitLock);
+}
+
+static void
+worker_shmem_shutdown(int code, Datum arg)
+{
+	if (MyWorkerTask)
+	{
+		SpinLockAcquire(&MyWorkerTask->mutex);
+		MyWorkerTask->pid = InvalidPid;
+		MyWorkerTask->exit_requested = false;
+		SpinLockRelease(&MyWorkerTask->mutex);
+	}
 }
 
 /* PG >= 14 does define this macro. */
@@ -276,14 +399,393 @@ partition_table(PG_FUNCTION_ARGS)
 	((relation)->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT)
 #endif
 
-static void
-partition_table_internal(PG_FUNCTION_ARGS)
+/*
+ * Start the background worker and wait until it exits.
+ */
+extern Datum partition_table_new(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(partition_table_new);
+Datum
+partition_table_new(PG_FUNCTION_ARGS)
 {
-	text	   *relname_src_t,
-			   *relname_dst,
-			   *relname_src_new_t;
-	char	   *relname_src,
-			   *relname_src_new;
+	text	*rel_src_t, *rel_src_new_t, *rel_dst_t;
+	RangeVar	*rv_src, *rv_src_new, *rv_dst;
+	BackgroundWorker worker;
+	BackgroundWorkerHandle *handle;
+	pid_t		pid;
+	BgwHandleStatus status;
+	Oid		dbid, roleid;
+	char	*dbname;
+	int		i;
+	WorkerTask	*task = NULL;
+	bool	found = false;
+	char	*msg = NULL;
+
+	rel_src_t = PG_GETARG_TEXT_PP(0);
+	rv_src = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_t));
+
+	rel_dst_t = PG_GETARG_TEXT_PP(1);
+	rv_dst = makeRangeVarFromNameList(textToQualifiedNameList(rel_dst_t));
+
+	rel_src_new_t = PG_GETARG_TEXT_PP(2);
+	rv_src_new = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_new_t));
+
+	if (rv_src->catalogname || rv_dst->catalogname || rv_src_new->catalogname)
+		ereport(ERROR,
+				(errmsg("relation may only be qualified by schema, not by database")));
+
+	/*
+	 * Technically it's possible to move the source relation to another schema
+	 * but don't bother for this version.
+	 */
+	if (rv_src_new->schemaname)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 (errmsg("the new source relation name may not be qualified"))));
+
+
+	dbid = MyDatabaseId;
+	roleid = GetUserId();
+
+	/* Find free task structure. */
+	for (i = 0; i < MAX_TASKS; i++)
+	{
+		task = &workerTasks[i];
+		SpinLockAcquire(&task->mutex);
+		if (task->dbid == InvalidOid && task->pid == InvalidPid)
+		{
+			/* Make sure that no other backend can use the task. */
+			task->dbid = MyDatabaseId;
+			found = true;
+		}
+		SpinLockRelease(&task->mutex);
+
+		if (found)
+			break;
+	}
+	if (!found)
+		ereport(ERROR, (errmsg("too many concurrent tasks in progress")));
+
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	sprintf(worker.bgw_library_name, "pg_rewrite");
+	sprintf(worker.bgw_function_name, "rewrite_worker_main");
+
+	/*
+	 * XXX The function can throw ERROR but the database should really exist,
+	 * so no need to put this code in the PG_TRY block.
+	 */
+	dbname = get_database_name(dbid);
+	snprintf(worker.bgw_name, BGW_MAXLEN,
+			 "pg_rewrite worker for database %s", dbname);
+	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_rewrite worker");
+
+	Assert(i < MAX_TASKS);
+	worker.bgw_main_arg = (Datum) i;
+
+	worker.bgw_notify_pid = MyProcPid;
+
+	/* Finalize the task. */
+	task->roleid = roleid;
+	task->exit_requested = false;
+	if (rv_src->schemaname)
+		namestrcpy(&task->relschema_src, rv_src->schemaname);
+	else
+		NameStr(task->relschema_src)[0] = '\0';
+	namestrcpy(&task->relname_src, rv_src->relname);
+	if (rv_dst->schemaname)
+		namestrcpy(&task->relschema_dst, rv_dst->schemaname);
+	else
+		NameStr(task->relschema_dst)[0] = '\0';
+	namestrcpy(&task->relname_dst, rv_dst->relname);
+	namestrcpy(&task->relname_src_new, rv_src_new->relname);
+
+	task->msg[0] = '\0';
+
+	/*
+	 * The worker does not reload the configuration, so we pass these GUC
+	 * setting via the shared memory.
+	 */
+	task->wait_after_load = rewrite_wait_after_load;
+	task->check_constraints = rewrite_check_constraints;
+
+	/*
+	 * Start the worker. Avoid leaking the task if the function ends due to
+	 * ERROR.
+	 */
+	PG_TRY();
+	{
+		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					 errmsg("could not register background process"),
+					 errhint("More details may be available in the server log.")));
+
+		status = WaitForBackgroundWorkerStartup(handle, &pid);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * It seems possible that the worker is trying to start even if we end
+		 * up here - at least when WaitForBackgroundWorkerStartup() got
+		 * interrupted.
+		 */
+		interrupt_worker(task);
+
+		release_task(task);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (status == BGWH_STOPPED)
+	{
+		/* Work already done? */
+		release_task(task);
+
+		PG_RETURN_VOID();
+	}
+	else if (status == BGWH_POSTMASTER_DIED)
+	{
+		ereport(ERROR,
+				(errmsg("could not start background worker because the postmaster died"),
+				 errhint("More details may be available in the server log.")));
+		/* No need to release the task in the shared memory. */
+	}
+
+	/*
+	 * WaitForBackgroundWorkerStartup() should not return
+	 * BGWH_NOT_YET_STARTED.
+	 */
+	Assert(status == BGWH_STARTED);
+
+	PG_TRY();
+	{
+		status = WaitForBackgroundWorkerShutdown(handle);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * Make sure the worker stops. Interrupt received from the user is the
+		 * typical use case.
+		 */
+		interrupt_worker(task);
+
+		release_task(task);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (status == BGWH_POSTMASTER_DIED)
+	{
+		ereport(ERROR,
+				(errmsg("the postmaster died before the background worker could finish"),
+				 errhint("More details may be available in the server log.")));
+		/* No need to release the task in the shared memory. */
+	}
+
+	/*
+	 * WaitForBackgroundWorkerShutdown() should not return anything else.
+	 */
+	Assert(status == BGWH_STOPPED);
+
+	if (strlen(task->msg) > 0)
+		msg = pstrdup(task->msg);
+
+	release_task(task);
+
+	/* Report the worker's ERROR in the backend. */
+	if (msg)
+		ereport(ERROR, (errmsg("%s", msg)));
+
+	PG_RETURN_VOID();
+}
+
+void
+rewrite_worker_main(Datum main_arg)
+{
+	Datum	arg;
+	int		i;
+	Oid		dbid, roleid;
+	char *relschema_src, *relname_src, *relname_src_new, *relschema_dst,
+		*relname_dst;
+	WorkerTask	*task;
+
+	/* The worker should do its cleanup when exiting. */
+	before_shmem_exit(worker_shmem_shutdown, (Datum) 0);
+
+	/*
+	 * The standard handlers for SIGTERM and SIGQUIT are fine, see
+	 * bgworker.c.
+	 */
+	BackgroundWorkerUnblockSignals();
+
+	/* Retrieve task index. */
+	Assert(MyBgworkerEntry != NULL);
+	arg = MyBgworkerEntry->bgw_main_arg;
+	i = DatumGetInt32(arg);
+	Assert(i >= 0 && i < MAX_TASKS);
+
+	Assert(MyWorkerTask == NULL);
+	task = MyWorkerTask = &workerTasks[i];
+
+	/*
+	 * The task should be fully initialized before the backend registers the
+	 * worker. Let's copy the arguments so that we have a consistent view -
+	 * see the explanation below.
+	 */
+	relschema_src = NameStr(task->relschema_src);
+	relschema_src = *relschema_src != '\0' ? pstrdup(relschema_src) : NULL;
+	relname_src = pstrdup(NameStr(task->relname_src));
+	relname_src_new = pstrdup(NameStr(task->relname_src_new));
+
+	relschema_dst = NameStr(task->relschema_dst);
+	relschema_dst = *relschema_dst != '\0' ? pstrdup(relschema_dst) : NULL;
+	relname_dst = pstrdup(NameStr(task->relname_dst));
+
+	rewrite_wait_after_load = task->wait_after_load;
+	rewrite_check_constraints = task->check_constraints;
+
+	/*
+	 * Get the information provided by the backend and set our pid.
+	 */
+	SpinLockAcquire(&MyWorkerTask->mutex);
+	Assert(MyWorkerTask->dbid != InvalidOid);
+	dbid = MyWorkerTask->dbid;
+	Assert(MyWorkerTask->roleid != InvalidOid);
+	roleid = MyWorkerTask->roleid;
+	task->pid = MyProcPid;
+	SpinLockRelease(&MyWorkerTask->mutex);
+
+	/*
+	 * Has the "owning" backend of this worker exited too early?
+	 */
+	if (!OidIsValid(dbid))
+	{
+		ereport(DEBUG1,
+				(errmsg("task cancelled before the worker could start")));
+		return;
+	}
+	/*
+	 * If the backend exits later (w/o waiting for the worker's exit), that
+	 * backend's ERRORs (which include interrupts) should make the worker stop
+	 * (via interrupt_worker()).
+	 */
+
+	BackgroundWorkerInitializeConnectionByOid(dbid, roleid, 0);
+
+	/* Do the actual work. */
+	StartTransactionCommand();
+	PG_TRY();
+	{
+		partition_table_impl(dbid, roleid, relschema_src, relname_src,
+							 relname_src_new, relschema_dst, relname_dst);
+
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		MemoryContext old_context = CurrentMemoryContext;
+		ErrorData	*edata;
+
+		HOLD_INTERRUPTS();
+
+		/*
+		 * CopyErrorData() requires the context to be different from
+		 * ErrorContext.
+		 */
+		MemoryContextSwitchTo(TopMemoryContext);
+		edata = CopyErrorData();
+		MemoryContextSwitchTo(old_context);
+
+		/*
+		 * The following shouldn't be necessary because the worker isn't going
+		 * to do anything else, but cleanup is just a good practice.
+		 *
+		 * XXX Should we re-throw the error instead of doing the cleanup? Not
+		 * sure, the error message would then appear twice in the log.
+		 */
+		FlushErrorState();
+
+		/* Not done by AbortTransaction(). */
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+		/*
+		 * Likewise, there seems to be no automatic cleanup of the origin, so
+		 * do it here.  The insertion into the ReplicationOriginRelationId
+		 * catalog will be rolled back due to the transaction abort.
+		 */
+		if (replorigin_session_origin != InvalidRepOriginId)
+			replorigin_session_origin = InvalidRepOriginId;
+
+		AbortOutOfAnyTransaction();
+
+		/*
+		 * Currently we only copy the error message, more fields, more
+		 * information can be added if needed. (Ideally we'd use the message
+		 * queue like parallel workers do, but the related PG core functions
+		 * have some parallel worker specific arguments.)
+		 */
+		strlcpy(task->msg, edata->message, MAX_ERR_MSG_LEN);
+
+		FreeErrorData(edata);
+
+		RESUME_INTERRUPTS();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * A substitute for CHECK_FOR_INTERRUPRS.
+ *
+ * procsignal_sigusr1_handler does not support signaling from a backend to a
+ * non-parallel worker (see the values of ProcSignalReason), so the worker
+ * cannot use CHECK_FOR_INTERRUPTS. Let's use shared memory to tell the worker
+ * that it should exit.  (SIGTERM would terminate the worker easily, but due
+ * to race conditions we could terminate another backend / worker which
+ * already managed to reuse this worker's PID.)
+ */
+void
+pg_rewrite_exit_if_requested(void)
+{
+	bool	exit_requested;
+
+	SpinLockAcquire(&MyWorkerTask->mutex);
+	exit_requested = MyWorkerTask->exit_requested;
+	SpinLockRelease(&MyWorkerTask->mutex);
+
+	if (!exit_requested)
+		return;
+
+	/*
+	 * There seems to be no automatic cleanup of the origin, so do it here.
+	 * The insertion into the ReplicationOriginRelationId catalog will be
+	 * rolled back due to the transaction abort.
+	 */
+	if (replorigin_session_origin != InvalidRepOriginId)
+		replorigin_session_origin = InvalidRepOriginId;
+
+	/*
+	 * Message similar to that in ProcessInterrupts(), but ERROR is
+	 * sufficient here. rewrite_worker_main() should catch it.
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_ADMIN_SHUTDOWN),
+			 errmsg("terminating pg_rewrite background worker due to administrator command")));
+}
+
+/*
+ * Introduced in pg_rewrite 1.1, to be called directly as opposed to calling
+ * via the postgres executor.
+ *
+ * The function is executed by a background worker. We do not catch ERRORs
+ * here, they will simply make the worker rollback any transaction and exit.
+ */
+static void
+partition_table_impl(Oid dbid, Oid roleid, char *relschema_src,
+					 char *relname_src, char *relname_src_new,
+					 char *relschema_dst, char *relname_dst)
+{
 	RangeVar   *relrv;
 	Relation	rel_src,
 				rel_dst;
@@ -313,27 +815,8 @@ partition_table_internal(PG_FUNCTION_ARGS)
 	ModifyTableState *mtstate;
 	struct PartitionTupleRouting *proute;
 
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 (errmsg("NULL arguments not allowed"))));
-
-	relname_src_t = PG_GETARG_TEXT_PP(0);
-	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname_src_t));
+	relrv = makeRangeVar(relschema_src, relname_src, -1);
 	rel_src = table_openrv(relrv, AccessShareLock);
-
-	relname_src_new_t = PG_GETARG_TEXT_PP(2);
-	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname_src_new_t));
-
-	/*
-	 * Technically it's possible to move the source relation to another schema
-	 * but don't bother for this version.
-	 */
-	if (relrv->schemaname || relrv->catalogname)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_NAME),
-				 (errmsg("the new source relation name may not be qualified"))));
-	relname_src_new = pstrdup(relrv->relname);
 
 	check_prerequisites(rel_src);
 
@@ -345,8 +828,6 @@ partition_table_internal(PG_FUNCTION_ARGS)
 	/* The table can have PK although the replica identity is FULL. */
 	if (ident_idx_src == InvalidOid && rel_src->rd_pkindex != InvalidOid)
 		ident_idx_src = rel_src->rd_pkindex;
-
-	relname_src = pstrdup(RelationGetRelationName(rel_src));
 
 	/*
 	 * Check if we're ready to capture changes that possibly take place during
@@ -434,16 +915,14 @@ partition_table_internal(PG_FUNCTION_ARGS)
 	 * This cannot be done before the call of setup_decoding() as the
 	 * exclusive lock does assign XID.
 	 */
-	relname_dst = PG_GETARG_TEXT_PP(1);
-	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname_dst));
+	relrv = makeRangeVar(relschema_dst, relname_dst, -1);
 	rel_dst = table_openrv(relrv, AccessExclusiveLock);
 
 	/* We're going to distribute data into partitions. */
 	if (rel_dst->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a partitioned table",
-						text_to_cstring(relname_dst))));
+				 errmsg("\"%s\" is not a partitioned table", relname_dst)));
 
 	/*
 	 * If the destination table is temporary, user probably messed things up
@@ -453,8 +932,7 @@ partition_table_internal(PG_FUNCTION_ARGS)
 	if (!RelationIsPermanent(rel_dst))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a permanent table",
-						text_to_cstring(relname_dst))));
+				 errmsg("\"%s\" is not a permanent table", relname_dst)));
 
 #if PG_VERSION_NUM >= 140000
 	part_desc = RelationGetPartitionDesc(rel_dst, true);
@@ -463,8 +941,7 @@ partition_table_internal(PG_FUNCTION_ARGS)
 #endif
 	if (part_desc->nparts == 0)
 		ereport(ERROR,
-				(errmsg("table \"%s\" has no partitions",
-						text_to_cstring(relname_dst))));
+				(errmsg("table \"%s\" has no partitions", relname_dst)));
 
 	/*
 	 * It's probably not necessary to lock the partitions in exclusive mode,
@@ -495,9 +972,10 @@ partition_table_internal(PG_FUNCTION_ARGS)
 	conv_map = convert_tuples_by_position(tup_desc_src,
 										  RelationGetDescr(rel_dst),
 
-	/*
-	 * XXX Better log message? User shouldn't see this anyway.
-	 */
+										  /*
+										   * XXX Better log message? User
+										   * shouldn't see this anyway.
+										   */
 										  "cannot map tuples");
 
 	/*
@@ -2911,7 +3389,7 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 				flattened = true;
 			}
 
-			CHECK_FOR_INTERRUPTS();
+			pg_rewrite_exit_if_requested();
 
 			/*
 			 * Check for a free slot early enough so that the current tuple
@@ -3006,7 +3484,7 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 			List	   *recheck;
 			BulkInsertState bistate;
 
-			CHECK_FOR_INTERRUPTS();
+			pg_rewrite_exit_if_requested();
 
 			if (i == batch_size)
 				tup_out = NULL;
@@ -3053,9 +3531,13 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 #if PG_VERSION_NUM >= 140000
 											false,	/* update */
 #endif
-											false,
-											NULL,
-											NIL);
+											false, /* noDupErr */
+											NULL,  /* specConflict */
+											NIL	   /* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+											, false /* onlySummarizing */
+#endif
+				);
 			ExecClearTuple(slot_dst);
 
 			/*

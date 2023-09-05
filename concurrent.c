@@ -6,7 +6,7 @@
  *	   This file handles changes that took place while the data is being
  *	   copied from one table to another one.
  *
- * Copyright (c) 2021, Cybertec PostgreSQL International GmbH
+ * Copyright (c) 2023, Cybertec PostgreSQL International GmbH
  *
  *-----------------------------------------------------------------------------------
  */
@@ -77,7 +77,7 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 	done = false;
 	while (!done)
 	{
-		CHECK_FOR_INTERRUPTS();
+		pg_rewrite_exit_if_requested();
 
 		done = pg_rewrite_decode_concurrent_changes(ctx, end_of_wal,
 													must_complete);
@@ -169,7 +169,7 @@ pg_rewrite_decode_concurrent_changes(LogicalDecodingContext *ctx,
 				part_current_segment = segno_new;
 			}
 
-			CHECK_FOR_INTERRUPTS();
+			pg_rewrite_exit_if_requested();
 		}
 		InvalidateSystemCaches();
 		CurrentResourceOwner = resowner_old;
@@ -288,9 +288,13 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 #if PG_VERSION_NUM >= 140000
 											false,	/* update */
 #endif
-											false,
-											NULL,
-											NIL);
+											false,	/* noDupErr */
+											NULL,	/* specConflict */
+											NIL		/* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+											, false /* onlySummarizing */
+#endif
+				);
 			ExecClearTuple(slot);
 
 			/*
@@ -358,9 +362,13 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 #if PG_VERSION_NUM >= 140000
 												false,	/* update */
 #endif
-												false,
-												NULL,
-												NIL);
+												false,	/* noDupErr */
+												NULL,	/* specConflict */
+												NIL		/* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+												, false /* onlySummarizing */
+#endif
+					);
 				ExecClearTuple(slot);
 				ninserts++;
 
@@ -390,7 +398,15 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 
 				if (change->kind == CHANGE_UPDATE_NEW)
 				{
-					simple_heap_update(rri->ri_RelationDesc, &ctid, tup);
+#if PG_VERSION_NUM >= 160000
+					TU_UpdateIndexes	update_indexes;
+#endif
+
+					simple_heap_update(rri->ri_RelationDesc, &ctid, tup
+#if PG_VERSION_NUM >= 160000
+									   , &update_indexes
+#endif
+						);
 					if (!HeapTupleIsHeapOnly(tup))
 					{
 						List	   *recheck;
@@ -411,9 +427,14 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 #if PG_VERSION_NUM >= 140000
 														false,	/* update */
 #endif
-														false,
-														NULL,
-														NIL);
+														false,	/* noDupErr */
+														NULL,	/* specConflict */
+														NIL		/* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+														/* onlySummarizing */
+														, update_indexes == TU_Summarizing
+#endif
+							);
 						ExecClearTuple(slot);
 						list_free(recheck);
 					}
