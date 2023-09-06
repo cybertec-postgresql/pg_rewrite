@@ -306,7 +306,7 @@ typedef struct WorkerTask
 	bool	check_constraints;
 } WorkerTask;
 
-#define		MAX_TASKS	1
+#define		MAX_TASKS	8
 
 /* Pointer to task array in the shared memory, available in all backends. */
 static WorkerTask	*workerTasks = NULL;
