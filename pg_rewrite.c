@@ -1463,12 +1463,12 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
 
 	/*
-	 * In order to be able to run partition_table() in each database
-	 * independently, thus the slot name should be database-specific.
+	 * In order to be able to run partition_table() for multiple tables at a
+	 * time, slot name should contain both database OID and relation OID.
 	 */
 	buf = makeStringInfo();
 	appendStringInfoString(buf, REPL_SLOT_BASE_NAME);
-	appendStringInfo(buf, "%u", MyDatabaseId);
+	appendStringInfo(buf, "%u_%u", MyDatabaseId, relid);
 #if PG_VERSION_NUM >= 140000
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false);
 #else
