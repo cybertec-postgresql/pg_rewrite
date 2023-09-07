@@ -1,0 +1,9 @@
+Release 1.1.0
+=============
+
+New Features
+------------
+
+1. Make the code compatible with PostgreSQL server version 16.
+
+2. Added progress monitoring.
