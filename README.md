@@ -74,12 +74,12 @@ CREATE TABLE measurement_y2006m03 PARTITION OF measurement_aux
 ```
 
 *It's essential that both the source (`measurement`) and destination
-(`measurement_aux`) table have an identity index, the easiest way to ensure
+(`measurement_aux`) table have an identity index. The easiest way to ensure
 this is to create `PRIMARY KEY` or `UNIQUE` constraint. Also note that the key
 (i.e. column list) of the identity index of the source and destination table
 must be identical. The identity is needed to process data changes that
-applications make while data is being copied from the source to the destination
-table.*
+applications make while data is being copied from the source to the
+destination table.*
 
 Also, unless you've set `rewrite.check_constraints` to `false`, make sure that
 the destination table has all the constraints that the source table has.
@@ -97,6 +97,19 @@ lock `measurement` exclusively and rename (1) `measurement` to
 `measurement_old`, (2) `measurement_aux` to `measurement`. Thus `measurement`
 ends up to be the partitioned table, while `measurement_old` is the original,
 non-partitioned table.
+
+# Progress monitoring
+
+If `partition_table()` takes long time to finish, you might be interested in
+the progress. The `pg_rewrite_progress` view shows all the pending calls of
+the function in the current database. The `src_table`, `dst_table` and
+`src_table_new` columns contain the arguments of the `partition_table()`
+function. `ins_initial` is the number of tuples inserted into the new table
+storage during the "initial load stage", i.e. the number of tuples present in
+the table before the processing started. On the other hand, `ins`, `upd` and
+`del` are the numbers of tuples inserted, updated and deleted by applications
+during the table processing. (These "concurrent data changes" must also be
+incorporated into the partitioned table, otherwise they'd get lost.)
 
 # Limitations
 

@@ -205,9 +205,6 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 {
 	TupleTableSlot *slot;
 	HeapTuple	tup_old = NULL;
-	double		ninserts,
-				nupdates,
-				ndeletes;
 
 	if (dstate->nchanges == 0)
 		return;
@@ -221,9 +218,6 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	ninserts = 0;
-	nupdates = 0;
-	ndeletes = 0;
 	while (tuplestore_gettupleslot(dstate->tstore, true, false,
 								   dstate->tsslot))
 	{
@@ -305,7 +299,10 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 			list_free(recheck);
 			pfree(tup);
 
-			ninserts++;
+			/* Update the progress information. */
+			SpinLockAcquire(&MyWorkerTask->mutex);
+			MyWorkerTask->progress.ins++;
+			SpinLockRelease(&MyWorkerTask->mutex);
 		}
 		else if (change->kind == CHANGE_UPDATE_NEW ||
 				 change->kind == CHANGE_DELETE)
@@ -342,7 +339,11 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 				find_tuple_in_partition(tup_old, rri_old->ri_RelationDesc,
 										partitions, key, nkeys, &ctid);
 				simple_heap_delete(rri_old->ri_RelationDesc, &ctid);
-				ndeletes++;
+
+				/* Update the progress information. */
+				SpinLockAcquire(&MyWorkerTask->mutex);
+				MyWorkerTask->progress.del++;
+				SpinLockRelease(&MyWorkerTask->mutex);
 
 				/* Insert the new tuple into its partition. */
 				ExecStoreHeapTuple(tup, slot, false);
@@ -370,7 +371,11 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 #endif
 					);
 				ExecClearTuple(slot);
-				ninserts++;
+
+				/* Update the progress information. */
+				SpinLockAcquire(&MyWorkerTask->mutex);
+				MyWorkerTask->progress.ins++;
+				SpinLockRelease(&MyWorkerTask->mutex);
 
 				list_free(recheck);
 			}
@@ -439,12 +444,19 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 						list_free(recheck);
 					}
 
-					nupdates++;
+					/* Update the progress information. */
+					SpinLockAcquire(&MyWorkerTask->mutex);
+					MyWorkerTask->progress.upd++;
+					SpinLockRelease(&MyWorkerTask->mutex);
 				}
 				else
 				{
 					simple_heap_delete(rri->ri_RelationDesc, &ctid);
-					ndeletes++;
+
+					/* Update the progress information. */
+					SpinLockAcquire(&MyWorkerTask->mutex);
+					MyWorkerTask->progress.del++;
+					SpinLockRelease(&MyWorkerTask->mutex);
 				}
 			}
 
@@ -469,10 +481,6 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		Assert(shouldFree);
 		pfree(tup_change);
 	}
-
-	elog(DEBUG1,
-		 "pg_rewrite: concurrent changes applied: %.0f inserts, %.0f updates, %.0f deletes.",
-		 ninserts, nupdates, ndeletes);
 
 	tuplestore_clear(dstate->tstore);
 	dstate->nchanges = 0;

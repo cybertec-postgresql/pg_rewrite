@@ -40,6 +40,7 @@
 #include "commands/tablespace.h"
 #include "executor/executor.h"
 #include "executor/execPartition.h"
+#include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "nodes/primnodes.h"
 #include "nodes/makefuncs.h"
@@ -263,56 +264,11 @@ partition_table(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/*
- * The new implementation, which delegates the execution to a background
- * worker (as opposed to the PG executor).
- *
- * Arguments are passed to the worker via this structure, located in the
- * shared memory.
- */
-typedef struct WorkerTask
-{
-	/* Connection info. */
-	Oid		dbid;
-	Oid		roleid;
-
-	/* Backend that performs the task both sets and clears this field. */
-	pid_t		pid;
-
-	/* See the comments of pg_rewrite_exit_if_requested(). */
-	bool	exit_requested;
-
-	/*
-	 * Use this when setting / clearing the fields above. Once dbid is set,
-	 * the task belongs to the backend that set it, so the other fields may be
-	 * assigned w/o the lock.
-	 */
-	slock_t		mutex;
-
-	/* The tables to work on. */
-	NameData	relschema_src;
-	NameData	relname_src;
-	NameData	relname_src_new;
-	NameData	relschema_dst;
-	NameData	relname_dst;
-
-	/* Space for the worker to send an error message to the backend. */
-#define	MAX_ERR_MSG_LEN	1024
-	char		msg[MAX_ERR_MSG_LEN];
-
-	/* The rewrite.wait_after_load GUC, for test purposes. */
-	int		wait_after_load;
-	/* The rewrite.check_constraints GUC, for test purposes. */
-	bool	check_constraints;
-} WorkerTask;
-
-#define		MAX_TASKS	8
-
 /* Pointer to task array in the shared memory, available in all backends. */
 static WorkerTask	*workerTasks = NULL;
 
 /* Each backend stores here the pointer to its task in the shared memory. */
-static WorkerTask *MyWorkerTask = NULL;
+WorkerTask *MyWorkerTask = NULL;
 
 static void
 interrupt_worker(WorkerTask *task)
@@ -453,8 +409,15 @@ partition_table_new(PG_FUNCTION_ARGS)
 		SpinLockAcquire(&task->mutex);
 		if (task->dbid == InvalidOid && task->pid == InvalidPid)
 		{
+			TaskProgress	*progress = &task->progress;
+
 			/* Make sure that no other backend can use the task. */
 			task->dbid = MyDatabaseId;
+			progress->ins_initial = 0;
+			progress->ins = 0;
+			progress->upd = 0;
+			progress->del = 0;
+
 			found = true;
 		}
 		SpinLockRelease(&task->mutex);
@@ -3547,6 +3510,11 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 			 */
 			list_free(recheck);
 			pfree(tup_out);
+
+			/* Update the progress information. */
+			SpinLockAcquire(&MyWorkerTask->mutex);
+			MyWorkerTask->progress.ins_initial++;
+			SpinLockRelease(&MyWorkerTask->mutex);
 		}
 
 		/*
@@ -3883,4 +3851,174 @@ get_partition_insert_state(partitions_hash *partitions, Oid part_oid)
 	Assert(entry->part_oid == part_oid);
 
 	return entry->bistate;
+}
+
+#define	TASK_LIST_RES_ATTRS	9
+
+/* Get information on squeeze workers on the current database. */
+PG_FUNCTION_INFO_V1(pg_rewrite_get_task_list);
+Datum
+pg_rewrite_get_task_list(PG_FUNCTION_ARGS)
+{
+	WorkerTask *tasks,
+			   *dst;
+	int			i,
+				ntasks = 0;
+#if PG_VERSION_NUM >= 150000
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+#else
+	FuncCallContext *funcctx;
+	int			call_cntr,
+				max_calls;
+	HeapTuple  *tuples;
+#endif
+
+	/*
+	 * Copy the task information at once.
+	 */
+	tasks = (WorkerTask *) palloc(MAX_TASKS * sizeof(WorkerTask));
+	dst = tasks;
+	for (i = 0; i < MAX_TASKS; i++)
+	{
+		WorkerTask *task = &workerTasks[i];
+		Oid		dbid;
+		pid_t	pid;
+
+		SpinLockAcquire(&task->mutex);
+		dbid = task->dbid;
+		pid = task->pid;
+		/*
+		 * A system call (see memcpy() below) while holding a spinlock is
+		 * probably not a good practice.
+		 */
+		SpinLockRelease(&task->mutex);
+
+		if (dbid == MyDatabaseId && pid != InvalidPid)
+		{
+			memcpy(dst, task, sizeof(WorkerTask));
+
+			/*
+			 * Since we copied the data w/o locking, verify if the task is
+			 * still owned by the same backend and the same worker. (In
+			 * theory, PID could be reused by another worker by now, but it's
+			 * very unlikely and even if that happened, it cannot cause
+			 * anything like data corruption.)
+			 */
+			SpinLockAcquire(&task->mutex);
+			if (task->dbid == dbid && task->pid == pid)
+			{
+				dst++;
+				ntasks++;
+			}
+			SpinLockRelease(&task->mutex);
+		}
+	}
+
+#if PG_VERSION_NUM >= 150000
+	for (i = 0; i < ntasks; i++)
+	{
+		WorkerTask	*task = &tasks[i];
+		TaskProgress *progress = &task->progress;
+		Datum		values[TASK_LIST_RES_ATTRS];
+		bool		isnull[TASK_LIST_RES_ATTRS];
+
+		memset(isnull, false, TASK_LIST_RES_ATTRS * sizeof(bool));
+
+		if (strlen(NameStr(task->relschema_src)) > 0)
+			values[0] = NameGetDatum(&task->relschema_src);
+		else
+			isnull[0] = true;
+		values[1] = NameGetDatum(&task->relname_src);
+		if (strlen(NameStr(task->relschema_dst)) > 0)
+			values[2] = NameGetDatum(&task->relschema_dst);
+		else
+			isnull[2] = true;
+		values[3] = NameGetDatum(&task->relname_dst);
+		values[4] = NameGetDatum(&task->relname_src_new);
+
+		values[5] = Int64GetDatum(progress->ins_initial);
+		values[6] = Int64GetDatum(progress->ins);
+		values[7] = Int64GetDatum(progress->upd);
+		values[8] = Int64GetDatum(progress->del);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, isnull);
+	}
+
+	return (Datum) 0;
+#else
+	/* Less trivial implementation, to be removed when PG 14 is EOL. */
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		TupleDesc	tupdesc;
+		int			ntuples = 0;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context "
+							"that cannot accept type record")));
+		/* XXX Is this necessary? */
+		funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+		/* Process only the slots that we really can display. */
+		tuples = (HeapTuple *) palloc0(ntasks * sizeof(HeapTuple));
+		for (i = 0; i < ntasks; i++)
+		{
+			WorkerTask *task = &tasks[i];
+			TaskProgress *progress = &task->progress;
+			Datum	   *values;
+			bool	   *isnull;
+
+			values = (Datum *) palloc(TASK_LIST_RES_ATTRS * sizeof(Datum));
+			isnull = (bool *) palloc0(TASK_LIST_RES_ATTRS * sizeof(bool));
+
+
+			if (strlen(NameStr(task->relschema_src)) > 0)
+				values[0] = NameGetDatum(&task->relschema_src);
+			else
+				isnull[0] = true;
+			values[1] = NameGetDatum(&task->relname_src);
+			if (strlen(NameStr(task->relschema_dst)) > 0)
+				values[2] = NameGetDatum(&task->relschema_dst);
+			else
+				isnull[2] = true;
+			values[3] = NameGetDatum(&task->relname_dst);
+			values[4] = NameGetDatum(&task->relname_src_new);
+
+			values[5] = Int64GetDatum(progress->ins_initial);
+			values[6] = Int64GetDatum(progress->ins);
+			values[7] = Int64GetDatum(progress->upd);
+			values[8] = Int64GetDatum(progress->del);
+
+			tuples[ntuples++] = heap_form_tuple(tupdesc, values, isnull);
+		}
+		funcctx->user_fctx = tuples;
+		funcctx->max_calls = ntuples;;
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+
+	call_cntr = funcctx->call_cntr;
+	max_calls = funcctx->max_calls;
+	tuples = (HeapTuple *) funcctx->user_fctx;
+
+	if (call_cntr < max_calls)
+	{
+		HeapTuple	tuple = tuples[call_cntr];
+		Datum		result;
+
+		result = HeapTupleGetDatum(tuple);
+		SRF_RETURN_NEXT(funcctx, result);
+	}
+	else
+		SRF_RETURN_DONE(funcctx);
+#endif
 }

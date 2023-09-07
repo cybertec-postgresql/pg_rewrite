@@ -218,6 +218,72 @@ typedef struct PartitionEntry
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
+/* Progress tracking. */
+typedef struct TaskProgress
+{
+	/* Tuples inserted during the initial load. */
+	int64		ins_initial;
+
+	/*
+	 * Tuples inserted, updated and deleted after the initial load (i.e.
+	 * during the catch-up phase).
+	 */
+	int64		ins;
+	int64		upd;
+	int64		del;
+} TaskProgress;
+
+/*
+ * The new implementation, which delegates the execution to a background
+ * worker (as opposed to the PG executor).
+ *
+ * Arguments are passed to the worker via this structure, located in the
+ * shared memory.
+ */
+typedef struct WorkerTask
+{
+	/* Connection info. */
+	Oid		dbid;
+	Oid		roleid;
+
+	/* Backend that performs the task both sets and clears this field. */
+	pid_t		pid;
+
+	/* See the comments of pg_rewrite_exit_if_requested(). */
+	bool	exit_requested;
+
+	/* The progress is only valid if the dbid is valid. */
+	TaskProgress	progress;
+
+	/*
+	 * Use this when setting / clearing the fields above. Once dbid is set,
+	 * the task belongs to the backend that set it, so the other fields may be
+	 * assigned w/o the lock.
+	 */
+	slock_t		mutex;
+
+	/* The tables to work on. */
+	NameData	relschema_src;
+	NameData	relname_src;
+	NameData	relname_src_new;
+	NameData	relschema_dst;
+	NameData	relname_dst;
+
+	/* Space for the worker to send an error message to the backend. */
+#define	MAX_ERR_MSG_LEN	1024
+	char		msg[MAX_ERR_MSG_LEN];
+
+	/* The rewrite.wait_after_load GUC, for test purposes. */
+	int		wait_after_load;
+	/* The rewrite.check_constraints GUC, for test purposes. */
+	bool	check_constraints;
+} WorkerTask;
+
+#define		MAX_TASKS	8
+
+/* Each backend stores here the pointer to its task in the shared memory. */
+extern WorkerTask *MyWorkerTask;
+
 extern PGDLLEXPORT void rewrite_worker_main(Datum main_arg);
 
 extern void pg_rewrite_exit_if_requested(void);
