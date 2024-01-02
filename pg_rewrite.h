@@ -246,7 +246,7 @@ typedef struct WorkerTask
 	Oid		dbid;
 	Oid		roleid;
 
-	/* Backend that performs the task both sets and clears this field. */
+	/* Worker that performs the task both sets and clears this field. */
 	pid_t		pid;
 
 	/* See the comments of pg_rewrite_exit_if_requested(). */
