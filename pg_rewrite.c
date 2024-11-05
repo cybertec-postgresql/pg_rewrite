@@ -1432,7 +1432,9 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	buf = makeStringInfo();
 	appendStringInfoString(buf, REPL_SLOT_BASE_NAME);
 	appendStringInfo(buf, "%u_%u", MyDatabaseId, relid);
-#if PG_VERSION_NUM >= 140000
+#if PG_VERSION_NUM >= 170000
+	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false, false, false);
+#elif PG_VERSION_NUM >= 140000
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false);
 #else
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL);
@@ -2674,8 +2676,6 @@ equal_dest_descs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 		if (strcmp(NameStr(attr1->attname), NameStr(attr2->attname)) != 0)
 			return false;
 		if (attr1->atttypid != attr2->atttypid)
-			return false;
-		if (attr1->attstattarget != attr2->attstattarget)
 			return false;
 		if (attr1->attlen != attr2->attlen)
 			return false;
