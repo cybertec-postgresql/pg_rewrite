@@ -93,7 +93,7 @@ typedef struct DecodingOutputState
 } DecodingOutputState;
 
 /* The WAL segment being decoded. */
-extern XLogSegNo part_current_segment;
+extern XLogSegNo rewrite_current_segment;
 
 extern void _PG_init(void);
 

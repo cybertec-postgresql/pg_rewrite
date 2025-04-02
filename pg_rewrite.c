@@ -77,7 +77,7 @@ static void partition_table_impl(Oid dbid, Oid roleid, char *relschema_src,
 static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* The WAL segment being decoded. */
-XLogSegNo	part_current_segment = 0;
+XLogSegNo	rewrite_current_segment = 0;
 
 /*
  * Information on a single constraint, needed to compare constraints of the
@@ -1466,7 +1466,7 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	/* Some WAL records should have been read. */
 	Assert(ctx->reader->EndRecPtr != InvalidXLogRecPtr);
 
-	XLByteToSeg(ctx->reader->EndRecPtr, part_current_segment,
+	XLByteToSeg(ctx->reader->EndRecPtr, rewrite_current_segment,
 				wal_segment_size);
 
 	/*

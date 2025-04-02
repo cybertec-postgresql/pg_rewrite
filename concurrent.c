@@ -161,12 +161,12 @@ pg_rewrite_decode_concurrent_changes(LogicalDecodingContext *ctx,
 			 */
 			end_lsn = ctx->reader->EndRecPtr;
 			XLByteToSeg(end_lsn, segno_new, wal_segment_size);
-			if (segno_new != part_current_segment)
+			if (segno_new != rewrite_current_segment)
 			{
 				LogicalConfirmReceivedLocation(end_lsn);
 				elog(DEBUG1, "pg_rewrite: confirmed receive location %X/%X",
 					 (uint32) (end_lsn >> 32), (uint32) end_lsn);
-				part_current_segment = segno_new;
+				rewrite_current_segment = segno_new;
 			}
 
 			pg_rewrite_exit_if_requested();
