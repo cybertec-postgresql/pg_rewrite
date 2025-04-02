@@ -692,8 +692,6 @@ rewrite_worker_main(Datum main_arg)
 		strlcpy(task->msg, edata->message, MAX_ERR_MSG_LEN);
 
 		FreeErrorData(edata);
-
-		RESUME_INTERRUPTS();
 	}
 	PG_END_TRY();
 }
