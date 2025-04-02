@@ -233,6 +233,11 @@ typedef struct TaskProgress
 	int64		del;
 } TaskProgress;
 
+typedef enum WorkerTaskKind
+{
+	WORKER_TASK_PARTITION
+} WorkerTaskKind;
+
 /*
  * The new implementation, which delegates the execution to a background
  * worker (as opposed to the PG executor).
@@ -242,6 +247,8 @@ typedef struct TaskProgress
  */
 typedef struct WorkerTask
 {
+	WorkerTaskKind	kind;
+
 	/* Connection info. */
 	Oid		dbid;
 	Oid		roleid;
@@ -263,9 +270,9 @@ typedef struct WorkerTask
 	slock_t		mutex;
 
 	/* The tables to work on. */
-	NameData	relschema_src;
-	NameData	relname_src;
-	NameData	relname_src_new;
+	NameData	relschema;
+	NameData	relname;
+	NameData	relname_new;
 	NameData	relschema_dst;
 	NameData	relname_dst;
 
@@ -274,6 +281,7 @@ typedef struct WorkerTask
 	char		msg[MAX_ERR_MSG_LEN];
 
 	/* The rewrite.wait_after_load GUC, for test purposes. */
+	/* TODO Consider using injection points instead */
 	int		wait_after_load;
 	/* The rewrite.check_constraints GUC, for test purposes. */
 	bool	check_constraints;

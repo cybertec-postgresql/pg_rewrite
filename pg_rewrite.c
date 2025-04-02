@@ -72,7 +72,7 @@ PG_MODULE_MAGIC;
 #define	REPL_PLUGIN_NAME	"pg_rewrite"
 
 static void partition_table_impl(char *relschema_src, char *relname_src,
-								 char *relname_src_new, char *relschema_dst,
+								 char *relname_new, char *relschema_dst,
 								 char *relname_dst);
 static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
@@ -107,6 +107,10 @@ typedef struct ConstraintInfo
 static void worker_shmem_request(void);
 static void worker_shmem_startup(void);
 static void worker_shmem_shutdown(int code, Datum arg);
+
+static WorkerTask *get_task(int *idx, char *relschema, char *relname);
+static void initialize_worker(BackgroundWorker *worker, int task_idx);
+static void run_worker(BackgroundWorker *worker, WorkerTask *task);
 
 static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
@@ -349,60 +353,16 @@ worker_shmem_shutdown(int code, Datum arg)
 	}
 }
 
-/* PG >= 14 does define this macro. */
-#if PG_VERSION_NUM < 140000
-#define RelationIsPermanent(relation) \
-	((relation)->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT)
-#endif
-
 /*
- * Start the background worker and wait until it exits.
+ * Find a free task structure and initialize the common fields.
  */
-extern Datum partition_table_new(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(partition_table_new);
-Datum
-partition_table_new(PG_FUNCTION_ARGS)
+static WorkerTask *
+get_task(int *idx, char *relschema, char *relname)
 {
-	text	*rel_src_t, *rel_src_new_t, *rel_dst_t;
-	RangeVar	*rv_src, *rv_src_new, *rv_dst;
-	BackgroundWorker worker;
-	BackgroundWorkerHandle *handle;
-	pid_t		pid;
-	BgwHandleStatus status;
-	Oid		dbid, roleid;
-	char	*dbname;
 	int		i;
 	WorkerTask	*task = NULL;
 	bool	found = false;
-	char	*msg = NULL;
 
-	rel_src_t = PG_GETARG_TEXT_PP(0);
-	rv_src = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_t));
-
-	rel_dst_t = PG_GETARG_TEXT_PP(1);
-	rv_dst = makeRangeVarFromNameList(textToQualifiedNameList(rel_dst_t));
-
-	rel_src_new_t = PG_GETARG_TEXT_PP(2);
-	rv_src_new = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_new_t));
-
-	if (rv_src->catalogname || rv_dst->catalogname || rv_src_new->catalogname)
-		ereport(ERROR,
-				(errmsg("relation may only be qualified by schema, not by database")));
-
-	/*
-	 * Technically it's possible to move the source relation to another schema
-	 * but don't bother for this version.
-	 */
-	if (rv_src_new->schemaname)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_NAME),
-				 (errmsg("the new source relation name may not be qualified"))));
-
-
-	dbid = MyDatabaseId;
-	roleid = GetUserId();
-
-	/* Find free task structure. */
 	for (i = 0; i < MAX_TASKS; i++)
 	{
 		task = &workerTasks[i];
@@ -428,50 +388,53 @@ partition_table_new(PG_FUNCTION_ARGS)
 	if (!found)
 		ereport(ERROR, (errmsg("too many concurrent tasks in progress")));
 
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+	/* Finalize the task. */
+	task->roleid = GetUserId();
+	task->exit_requested = false;
+	if (relschema)
+		namestrcpy(&task->relschema, relschema);
+	else
+		NameStr(task->relschema)[0] = '\0';
+	namestrcpy(&task->relname, relname);
+
+	task->msg[0] = '\0';
+
+	*idx = i;
+	return task;
+}
+
+static void
+initialize_worker(BackgroundWorker *worker, int task_idx)
+{
+	char	*dbname;
+
+	worker->bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	worker.bgw_restart_time = BGW_NEVER_RESTART;
-	sprintf(worker.bgw_library_name, "pg_rewrite");
-	sprintf(worker.bgw_function_name, "rewrite_worker_main");
+	worker->bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker->bgw_restart_time = BGW_NEVER_RESTART;
+	sprintf(worker->bgw_library_name, "pg_rewrite");
+	sprintf(worker->bgw_function_name, "rewrite_worker_main");
 
 	/*
 	 * XXX The function can throw ERROR but the database should really exist,
 	 * so no need to put this code in the PG_TRY block.
 	 */
-	dbname = get_database_name(dbid);
-	snprintf(worker.bgw_name, BGW_MAXLEN,
+	dbname = get_database_name(MyDatabaseId);
+	snprintf(worker->bgw_name, BGW_MAXLEN,
 			 "pg_rewrite worker for database %s", dbname);
-	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_rewrite worker");
+	snprintf(worker->bgw_type, BGW_MAXLEN, "pg_rewrite worker");
 
-	Assert(i < MAX_TASKS);
-	worker.bgw_main_arg = (Datum) i;
+	worker->bgw_main_arg = (Datum) task_idx;
+	worker->bgw_notify_pid = MyProcPid;
+}
 
-	worker.bgw_notify_pid = MyProcPid;
-
-	/* Finalize the task. */
-	task->roleid = roleid;
-	task->exit_requested = false;
-	if (rv_src->schemaname)
-		namestrcpy(&task->relschema_src, rv_src->schemaname);
-	else
-		NameStr(task->relschema_src)[0] = '\0';
-	namestrcpy(&task->relname_src, rv_src->relname);
-	if (rv_dst->schemaname)
-		namestrcpy(&task->relschema_dst, rv_dst->schemaname);
-	else
-		NameStr(task->relschema_dst)[0] = '\0';
-	namestrcpy(&task->relname_dst, rv_dst->relname);
-	namestrcpy(&task->relname_src_new, rv_src_new->relname);
-
-	task->msg[0] = '\0';
-
-	/*
-	 * The worker does not reload the configuration, so we pass these GUC
-	 * setting via the shared memory.
-	 */
-	task->wait_after_load = rewrite_wait_after_load;
-	task->check_constraints = rewrite_check_constraints;
+static void
+run_worker(BackgroundWorker *worker, WorkerTask *task)
+{
+	BackgroundWorkerHandle *handle;
+	BgwHandleStatus status;
+	pid_t		pid;
+	char	*msg = NULL;
 
 	/*
 	 * Start the worker. Avoid leaking the task if the function ends due to
@@ -479,7 +442,7 @@ partition_table_new(PG_FUNCTION_ARGS)
 	 */
 	PG_TRY();
 	{
-		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+		if (!RegisterDynamicBackgroundWorker(worker, &handle))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 					 errmsg("could not register background process"),
@@ -504,9 +467,7 @@ partition_table_new(PG_FUNCTION_ARGS)
 	if (status == BGWH_STOPPED)
 	{
 		/* Work already done? */
-		release_task(task);
-
-		PG_RETURN_VOID();
+		goto done;
 	}
 	else if (status == BGWH_POSTMASTER_DIED)
 	{
@@ -552,6 +513,7 @@ partition_table_new(PG_FUNCTION_ARGS)
 	 */
 	Assert(status == BGWH_STOPPED);
 
+done:
 	if (strlen(task->msg) > 0)
 		msg = pstrdup(task->msg);
 
@@ -560,6 +522,73 @@ partition_table_new(PG_FUNCTION_ARGS)
 	/* Report the worker's ERROR in the backend. */
 	if (msg)
 		ereport(ERROR, (errmsg("%s", msg)));
+
+}
+
+/* PG >= 14 does define this macro. */
+#if PG_VERSION_NUM < 140000
+#define RelationIsPermanent(relation) \
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT)
+#endif
+
+/*
+ * Start the background worker and wait until it exits.
+ */
+extern Datum partition_table_new(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(partition_table_new);
+Datum
+partition_table_new(PG_FUNCTION_ARGS)
+{
+	text	*rel_src_t, *rel_src_new_t, *rel_dst_t;
+	RangeVar	*rv_src, *rv_src_new, *rv_dst;
+	BackgroundWorker worker;
+	WorkerTask	*task;
+	int		task_idx;
+
+	rel_src_t = PG_GETARG_TEXT_PP(0);
+	rv_src = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_t));
+
+	rel_dst_t = PG_GETARG_TEXT_PP(1);
+	rv_dst = makeRangeVarFromNameList(textToQualifiedNameList(rel_dst_t));
+
+	rel_src_new_t = PG_GETARG_TEXT_PP(2);
+	rv_src_new = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_new_t));
+
+	if (rv_src->catalogname || rv_dst->catalogname || rv_src_new->catalogname)
+		ereport(ERROR,
+				(errmsg("relation may only be qualified by schema, not by database")));
+
+	/*
+	 * Technically it's possible to move the source relation to another schema
+	 * but don't bother for this version.
+	 */
+	if (rv_src_new->schemaname)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 (errmsg("the new source relation name may not be qualified"))));
+
+	task = get_task(&task_idx, rv_src->schemaname, rv_src->relname);
+	Assert(task_idx < MAX_TASKS);
+	task->kind = WORKER_TASK_PARTITION;
+
+	/* Fill-in the partitioning specific fields. */
+	if (rv_dst->schemaname)
+		namestrcpy(&task->relschema_dst, rv_dst->schemaname);
+	else
+		NameStr(task->relschema_dst)[0] = '\0';
+	namestrcpy(&task->relname_dst, rv_dst->relname);
+	namestrcpy(&task->relname_new, rv_src_new->relname);
+
+	initialize_worker(&worker, task_idx);
+
+	/*
+	 * The worker does not reload the configuration, so we pass these GUC
+	 * setting via the shared memory.
+	 */
+	task->wait_after_load = rewrite_wait_after_load;
+	task->check_constraints = rewrite_check_constraints;
+
+	run_worker(&worker, task);
 
 	PG_RETURN_VOID();
 }
@@ -570,7 +599,7 @@ rewrite_worker_main(Datum main_arg)
 	Datum	arg;
 	int		i;
 	Oid		dbid, roleid;
-	char *relschema_src, *relname_src, *relname_src_new, *relschema_dst,
+	char *relschema, *relname, *relname_new, *relschema_dst,
 		*relname_dst;
 	WorkerTask	*task;
 
@@ -597,10 +626,10 @@ rewrite_worker_main(Datum main_arg)
 	 * worker. Let's copy the arguments so that we have a consistent view -
 	 * see the explanation below.
 	 */
-	relschema_src = NameStr(task->relschema_src);
-	relschema_src = *relschema_src != '\0' ? pstrdup(relschema_src) : NULL;
-	relname_src = pstrdup(NameStr(task->relname_src));
-	relname_src_new = pstrdup(NameStr(task->relname_src_new));
+	relschema = NameStr(task->relschema);
+	relschema = *relschema != '\0' ? pstrdup(relschema) : NULL;
+	relname = pstrdup(NameStr(task->relname));
+	relname_new = pstrdup(NameStr(task->relname_new));
 
 	relschema_dst = NameStr(task->relschema_dst);
 	relschema_dst = *relschema_dst != '\0' ? pstrdup(relschema_dst) : NULL;
@@ -641,9 +670,9 @@ rewrite_worker_main(Datum main_arg)
 	StartTransactionCommand();
 	PG_TRY();
 	{
-		partition_table_impl(relschema_src, relname_src,
-							 relname_src_new, relschema_dst, relname_dst);
-
+		Assert(MyWorkerTask->kind == WORKER_TASK_PARTITION);
+		partition_table_impl(relschema, relname, relname_new,
+							 relschema_dst, relname_dst);
 		CommitTransactionCommand();
 	}
 	PG_CATCH();
@@ -744,7 +773,7 @@ pg_rewrite_exit_if_requested(void)
  */
 static void
 partition_table_impl(char *relschema_src, char *relname_src,
-					 char *relname_src_new, char *relschema_dst,
+					 char *relname_new, char *relschema_dst,
 					 char *relname_dst)
 {
 	RangeVar   *relrv;
@@ -1262,7 +1291,7 @@ partition_table_impl(char *relschema_src, char *relname_src,
 	pfree(ident_key);
 
 	/* Rename the tables. */
-	RenameRelationInternal(relid_src, relname_src_new, false, false);
+	RenameRelationInternal(relid_src, relname_new, false, false);
 
 	/*
 	 * The new relation will be renamed to the old one, so make sure renaming
@@ -3924,17 +3953,17 @@ pg_rewrite_get_task_list(PG_FUNCTION_ARGS)
 
 		memset(isnull, false, TASK_LIST_RES_ATTRS * sizeof(bool));
 
-		if (strlen(NameStr(task->relschema_src)) > 0)
-			values[0] = NameGetDatum(&task->relschema_src);
+		if (strlen(NameStr(task->relschema)) > 0)
+			values[0] = NameGetDatum(&task->relschema);
 		else
 			isnull[0] = true;
-		values[1] = NameGetDatum(&task->relname_src);
+		values[1] = NameGetDatum(&task->relname);
 		if (strlen(NameStr(task->relschema_dst)) > 0)
 			values[2] = NameGetDatum(&task->relschema_dst);
 		else
 			isnull[2] = true;
 		values[3] = NameGetDatum(&task->relname_dst);
-		values[4] = NameGetDatum(&task->relname_src_new);
+		values[4] = NameGetDatum(&task->relname_new);
 
 		values[5] = Int64GetDatum(progress->ins_initial);
 		values[6] = Int64GetDatum(progress->ins);
@@ -3987,7 +4016,7 @@ pg_rewrite_get_task_list(PG_FUNCTION_ARGS)
 			else
 				isnull[2] = true;
 			values[3] = NameGetDatum(&task->relname_dst);
-			values[4] = NameGetDatum(&task->relname_src_new);
+			values[4] = NameGetDatum(&task->relname_new);
 
 			values[5] = Int64GetDatum(progress->ins_initial);
 			values[6] = Int64GetDatum(progress->ins);
