@@ -71,9 +71,9 @@ PG_MODULE_MAGIC;
 #define	REPL_SLOT_BASE_NAME	"pg_rewrite_slot_"
 #define	REPL_PLUGIN_NAME	"pg_rewrite"
 
-static void partition_table_impl(Oid dbid, Oid roleid, char *relschema_src,
-								 char *relname_src, char *relname_src_new,
-								 char *relschema_dst, char *relname_dst);
+static void partition_table_impl(char *relschema_src, char *relname_src,
+								 char *relname_src_new, char *relschema_dst,
+								 char *relname_dst);
 static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* The WAL segment being decoded. */
@@ -641,7 +641,7 @@ rewrite_worker_main(Datum main_arg)
 	StartTransactionCommand();
 	PG_TRY();
 	{
-		partition_table_impl(dbid, roleid, relschema_src, relname_src,
+		partition_table_impl(relschema_src, relname_src,
 							 relname_src_new, relschema_dst, relname_dst);
 
 		CommitTransactionCommand();
@@ -743,9 +743,9 @@ pg_rewrite_exit_if_requested(void)
  * here, they will simply make the worker rollback any transaction and exit.
  */
 static void
-partition_table_impl(Oid dbid, Oid roleid, char *relschema_src,
-					 char *relname_src, char *relname_src_new,
-					 char *relschema_dst, char *relname_dst)
+partition_table_impl(char *relschema_src, char *relname_src,
+					 char *relname_src_new, char *relschema_dst,
+					 char *relname_dst)
 {
 	RangeVar   *relrv;
 	Relation	rel_src,
