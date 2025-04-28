@@ -22,14 +22,19 @@
 
 static void apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 									 struct PartitionTupleRouting *proute,
+									 Relation rel_dst,
 									 DecodingOutputState *dstate,
 									 ScanKey key, int nkeys,
+									 Relation ident_index,
+									 TupleTableSlot	*ind_slot,
 									 partitions_hash *partitions,
 									 TupleConversionMap *conv_map);
 static void find_tuple_in_partition(HeapTuple tup, Relation partition,
 									partitions_hash *partitions,
-									ScanKey key, int nkeys,
-									ItemPointer ctid);
+									ScanKey key, int nkeys, ItemPointer ctid);
+static void find_tuple(HeapTuple tup, Relation rel, Relation ident_index,
+					   ScanKey key, int nkeys, ItemPointer ctid,
+					   TupleTableSlot *ind_slot);
 static bool processing_time_elapsed(struct timeval *utmost);
 
 static void plugin_startup(LogicalDecodingContext *ctx,
@@ -65,6 +70,8 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 									  CatalogState *cat_state,
 									  Relation rel_dst, ScanKey ident_key,
 									  int ident_key_nentries,
+									  Relation ident_index,
+									  TupleTableSlot *ind_slot,
 									  LOCKMODE lock_held,
 									  partitions_hash *partitions,
 									  TupleConversionMap *conv_map,
@@ -97,9 +104,9 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 		 * processing partway through. Partial cleanup of the tuplestore seems
 		 * non-trivial.
 		 */
-		apply_concurrent_changes(estate, mtstate, proute,
-								 dstate, ident_key,
-								 ident_key_nentries, partitions, conv_map);
+		apply_concurrent_changes(estate, mtstate, proute, rel_dst,
+								 dstate, ident_key, ident_key_nentries,
+								 ident_index, ind_slot, partitions, conv_map);
 	}
 
 	return true;
@@ -198,16 +205,24 @@ pg_rewrite_decode_concurrent_changes(LogicalDecodingContext *ctx,
 static void
 apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 						 struct PartitionTupleRouting *proute,
+						 Relation rel_dst,
 						 DecodingOutputState *dstate,
 						 ScanKey key, int nkeys,
+						 Relation ident_index,
+						 TupleTableSlot	*ind_slot,
 						 partitions_hash *partitions,
 						 TupleConversionMap *conv_map)
 {
 	TupleTableSlot *slot;
+	BulkInsertState	bistate_nonpart = NULL;
 	HeapTuple	tup_old = NULL;
 
 	if (dstate->nchanges == 0)
 		return;
+
+	/* See perform_initial_load() */
+	if (proute == NULL)
+		bistate_nonpart = GetBulkInsertState();
 
 	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
 	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsHeapTuple);
@@ -228,7 +243,7 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		ConcurrentChange *change;
 		bool		isnull[1];
 		Datum		values[1];
-		ResultRelInfo *rri;
+		ResultRelInfo *rri = NULL;
 
 		/* Get the change from the single-column tuple. */
 		tup_change = ExecFetchSlotHeapTuple(dstate->tsslot, false, &shouldFree);
@@ -250,7 +265,7 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		else if (change->kind == CHANGE_INSERT)
 		{
 			List	   *recheck;
-			Relation	partition;
+			Relation	rel_ins;
 			BulkInsertState bistate;
 
 			Assert(tup_old == NULL);
@@ -259,14 +274,24 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 			if (conv_map)
 				tup = convert_tuple_for_dest_table(tup, conv_map);
 			ExecStoreHeapTuple(tup, slot, false);
-			rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-									proute, slot, estate);
-			partition = rri->ri_RelationDesc;
+			if (proute)
+			{
+				rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
+										proute, slot, estate);
+				rel_ins = rri->ri_RelationDesc;
 
-			bistate = get_partition_insert_state(partitions,
-												 RelationGetRelid(partition));
+				bistate = get_partition_insert_state(partitions,
+													 RelationGetRelid(rel_ins));
+			}
+			else
+			{
+				/* Non-partitioned table. */
+				rri = mtstate->resultRelInfo;
+				rel_ins = rel_dst;
+				bistate = bistate_nonpart;
+			}
 			Assert(bistate != NULL);
-			table_tuple_insert(partition, slot, GetCurrentCommandId(true), 0,
+			table_tuple_insert(rel_ins, slot, GetCurrentCommandId(true), 0,
 							   bistate);
 
 #if PG_VERSION_NUM < 140000
@@ -318,7 +343,7 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 			ExecClearTuple(slot);
 
 			/* Is this a cross-partition update? */
-			if (change->kind == CHANGE_UPDATE_NEW && tup_old)
+			if (partitions && change->kind == CHANGE_UPDATE_NEW && tup_old)
 			{
 				if (conv_map)
 					tup_old = convert_tuple_for_dest_table(tup_old, conv_map);
@@ -385,8 +410,9 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 				ItemPointerData ctid;
 
 				/*
-				 * Both old and new tuple are in the same partition. Find the
-				 * tuple to be updated or deleted.
+				 * Both old and new tuple are in the same partition (or the
+				 * target table is not partitioned). Find the tuple to be
+				 * updated or deleted.
 				 */
 				if (change->kind == CHANGE_UPDATE_NEW)
 					tup_key = tup_old != NULL ? tup_old : tup;
@@ -397,9 +423,12 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 					tup_key = tup;
 				}
 
-				find_tuple_in_partition(tup_key, rri->ri_RelationDesc,
-										partitions, key, nkeys, &ctid);
-
+				if (partitions)
+					find_tuple_in_partition(tup_key, rri->ri_RelationDesc,
+											partitions, key, nkeys, &ctid);
+				else
+					find_tuple(tup_key, rel_dst, ident_index, key, nkeys,
+							   &ctid, ind_slot);
 
 				if (change->kind == CHANGE_UPDATE_NEW)
 				{
@@ -451,6 +480,8 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 				}
 				else
 				{
+					Assert(change->kind == CHANGE_DELETE);
+
 					simple_heap_delete(rri->ri_RelationDesc, &ctid);
 
 					/* Update the progress information. */
@@ -489,11 +520,13 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 
 	/* Cleanup. */
 	ExecDropSingleTupleTableSlot(slot);
+	if (bistate_nonpart)
+		FreeBulkInsertState(bistate_nonpart);
 }
 
 /*
- * Find tuple whose identity key is in 'tup_ind' in partition 'partition' and
- * put its location into 'ctid'.
+ * Find tuple whose identity key is passed as 'tup' in relation 'rel' and put
+ * its location into 'ctid'.
  */
 static void
 find_tuple_in_partition(HeapTuple tup, Relation partition,
@@ -502,24 +535,33 @@ find_tuple_in_partition(HeapTuple tup, Relation partition,
 {
 	Oid			part_oid = RelationGetRelid(partition);
 	PartitionEntry *entry;
-	Relation	ident_index;
+
+	entry = partitions_lookup(partitions, part_oid);
+	if (entry == NULL)
+		elog(ERROR, "identity index not found for partition %u", part_oid);
+	Assert(entry->part_oid == part_oid);
+
+	find_tuple(tup, partition, entry->ident_index, key, nkeys, ctid,
+			   entry->ind_slot);
+}
+
+/*
+ * Find tuple whose identity key is passed as 'tup' in relation 'rel' and put
+ * its location into 'ctid'.
+ */
+static void
+find_tuple(HeapTuple tup, Relation rel, Relation ident_index, ScanKey key,
+		   int nkeys, ItemPointer ctid, TupleTableSlot *ind_slot)
+{
 	Form_pg_index ident_form;
 	int2vector *ident_indkey;
 	IndexScanDesc scan;
 	int			i;
 	HeapTuple	tup_exist;
 
-	/* Delete the old tuple from its partition. */
-	entry = partitions_lookup(partitions, part_oid);
-	if (entry == NULL)
-		elog(ERROR, "identity index not found for partition %u", part_oid);
-	Assert(entry->part_oid == part_oid);
-
-	ident_index = entry->ident_index;
 	ident_form = ident_index->rd_index;
 	ident_indkey = &ident_form->indkey;
-	scan = index_beginscan(partition, ident_index, GetActiveSnapshot(), nkeys,
-						   0);
+	scan = index_beginscan(rel, ident_index, GetActiveSnapshot(), nkeys, 0);
 	index_rescan(scan, key, nkeys, NULL, 0);
 
 	/* Use the incoming tuple to finalize the scan key. */
@@ -533,15 +575,15 @@ find_tuple_in_partition(HeapTuple tup, Relation partition,
 		attno_heap = ident_indkey->values[i];
 		entry->sk_argument = heap_getattr(tup,
 										  attno_heap,
-										  partition->rd_att,
+										  rel->rd_att,
 										  &isnull);
 		Assert(!isnull);
 	}
-	if (index_getnext_slot(scan, ForwardScanDirection, entry->ind_slot))
+	if (index_getnext_slot(scan, ForwardScanDirection, ind_slot))
 	{
 		bool		shouldFreeInd;
 
-		tup_exist = ExecFetchSlotHeapTuple(entry->ind_slot, false,
+		tup_exist = ExecFetchSlotHeapTuple(ind_slot, false,
 										   &shouldFreeInd);
 		/* TTSOpsBufferHeapTuple has .get_heap_tuple != NULL. */
 		Assert(!shouldFreeInd);

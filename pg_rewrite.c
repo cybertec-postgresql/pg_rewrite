@@ -71,9 +71,10 @@ PG_MODULE_MAGIC;
 #define	REPL_SLOT_BASE_NAME	"pg_rewrite_slot_"
 #define	REPL_PLUGIN_NAME	"pg_rewrite"
 
-static void partition_table_impl(char *relschema_src, char *relname_src,
-								 char *relname_new, char *relschema_dst,
-								 char *relname_dst);
+static void rewrite_table_impl(char *relschema_src, char *relname_src,
+							   char *relname_new, char *relschema_dst,
+							   char *relname_dst);
+static Relation get_identity_index(Relation rel, TupleDesc tup_desc);
 static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* The WAL segment being decoded. */
@@ -167,6 +168,8 @@ static bool perform_final_merge(EState *estate,
 								Oid relid_src, Oid *indexes_src, int nindexes,
 								Relation rel_dst, ScanKey ident_key,
 								int ident_key_nentries,
+								Relation ident_index,
+								TupleTableSlot *ind_slot,
 								CatalogState *cat_state,
 								LogicalDecodingContext *ctx,
 								partitions_hash *ident_indexes,
@@ -255,18 +258,35 @@ _PG_init(void)
  * The original implementation would certainly fail on PG 16 and higher, due
  * to the commit 240e0dbacd (in the master branch) - this commit makes it
  * impossible to invoke our functionality via the PG executor. It's not worth
- * supporting lower versions of pg_rewrite on lower versions of PG server.
+ * supporting lower versions of pg_rewrite on lower versions of PG server. We
+ * keep the symbol in the library so that the upgrade path works.
  */
 extern Datum partition_table(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(partition_table);
 Datum
 partition_table(PG_FUNCTION_ARGS)
 {
-	ereport(ERROR, (errmsg("the old implementation of the function is no longer supported"),
+	ereport(ERROR, (errmsg("the function is no longer supported"),
 					errhint("please run \"ALTER EXTENSION pg_rewrite UPDATE\"")));
 
 	PG_RETURN_VOID();
 }
+
+/*
+ * Likewise, keep the symbol because the upgrade path to 1.3 (or higher)
+ * requires that.
+ */
+extern Datum partition_table_new(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(partition_table_new);
+Datum
+partition_table_new(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errmsg("the function is no longer supported"),
+					errhint("please run \"ALTER EXTENSION pg_rewrite UPDATE\"")));
+
+	PG_RETURN_VOID();
+}
+
 
 /* Pointer to task array in the shared memory, available in all backends. */
 static WorkerTask	*workerTasks = NULL;
@@ -534,10 +554,10 @@ done:
 /*
  * Start the background worker and wait until it exits.
  */
-extern Datum partition_table_new(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(partition_table_new);
+extern Datum rewrite_table(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(rewrite_table);
 Datum
-partition_table_new(PG_FUNCTION_ARGS)
+rewrite_table(PG_FUNCTION_ARGS)
 {
 	text	*rel_src_t, *rel_src_new_t, *rel_dst_t;
 	RangeVar	*rv_src, *rv_src_new, *rv_dst;
@@ -671,8 +691,8 @@ rewrite_worker_main(Datum main_arg)
 	PG_TRY();
 	{
 		Assert(MyWorkerTask->kind == WORKER_TASK_PARTITION);
-		partition_table_impl(relschema, relname, relname_new,
-							 relschema_dst, relname_dst);
+		rewrite_table_impl(relschema, relname, relname_new, relschema_dst,
+						   relname_dst);
 		CommitTransactionCommand();
 	}
 	PG_CATCH();
@@ -765,24 +785,25 @@ pg_rewrite_exit_if_requested(void)
 }
 
 /*
- * Introduced in pg_rewrite 1.1, to be called directly as opposed to calling
- * via the postgres executor.
+ * Perform the rewriting.
  *
  * The function is executed by a background worker. We do not catch ERRORs
  * here, they will simply make the worker rollback any transaction and exit.
  */
 static void
-partition_table_impl(char *relschema_src, char *relname_src,
-					 char *relname_new, char *relschema_dst,
-					 char *relname_dst)
+rewrite_table_impl(char *relschema_src, char *relname_src,
+				   char *relname_new, char *relschema_dst,
+				   char *relname_dst)
 {
 	RangeVar   *relrv;
 	Relation	rel_src,
 				rel_dst;
-	PartitionDesc part_desc;
+	PartitionDesc part_desc = NULL;
 	Oid			ident_idx_src;
 	Oid			relid_src;
+	Relation	ident_index = NULL;
 	ScanKey		ident_key = NULL;
+	TupleTableSlot	*ind_slot = NULL;
 	int			i,
 				ident_key_nentries = 0;
 	LogicalDecodingContext *ctx;
@@ -798,12 +819,12 @@ partition_table_impl(char *relschema_src, char *relname_src,
 	bool		invalid_index = false;
 	IndexCatInfo *ind_info;
 	bool		source_finalized;
-	Relation   *parts_dst;
-	partitions_hash *partitions;
+	Relation   *parts_dst = NULL;
+	partitions_hash *partitions = NULL;
 	TupleConversionMap *conv_map;
 	EState	   *estate;
 	ModifyTableState *mtstate;
-	struct PartitionTupleRouting *proute;
+	struct PartitionTupleRouting *proute = NULL;
 
 	relrv = makeRangeVar(relschema_src, relname_src, -1);
 	rel_src = table_openrv(relrv, AccessShareLock);
@@ -834,6 +855,11 @@ partition_table_impl(char *relschema_src, char *relname_src,
 	 * this error code seems to be the best match.
 	 * (ERRCODE_TRIGGERED_ACTION_EXCEPTION might be worth consideration as
 	 * well.)
+	 */
+	/*
+	 * TODO Consider
+	 * https://github.com/cybertec-postgresql/pg_squeeze/issues/84 (also
+	 * update README).
 	 */
 	if (!OidIsValid(ident_idx_src))
 		ereport(ERROR,
@@ -908,12 +934,6 @@ partition_table_impl(char *relschema_src, char *relname_src,
 	relrv = makeRangeVar(relschema_dst, relname_dst, -1);
 	rel_dst = table_openrv(relrv, AccessExclusiveLock);
 
-	/* We're going to distribute data into partitions. */
-	if (rel_dst->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a partitioned table", relname_dst)));
-
 	/*
 	 * If the destination table is temporary, user probably messed things up
 	 * and a lot of data would be lost at the end of the session. Unlogged
@@ -924,23 +944,30 @@ partition_table_impl(char *relschema_src, char *relname_src,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a permanent table", relname_dst)));
 
-#if PG_VERSION_NUM >= 140000
-	part_desc = RelationGetPartitionDesc(rel_dst, true);
-#else
-	part_desc = RelationGetPartitionDesc(rel_dst);
-#endif
-	if (part_desc->nparts == 0)
-		ereport(ERROR,
-				(errmsg("table \"%s\" has no partitions", relname_dst)));
-
 	/*
-	 * It's probably not necessary to lock the partitions in exclusive mode,
-	 * but we'll need to open them later. Simply use the exclusive lock
-	 * instead of trying to determine the minimum lock level needed.
+	 * Are we going to route the data into partitions?
 	 */
-	parts_dst = (Relation *) palloc(part_desc->nparts * sizeof(Relation));
-	for (i = 0; i < part_desc->nparts; i++)
-		parts_dst[i] = table_open(part_desc->oids[i], AccessExclusiveLock);
+	if (rel_dst->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+#if PG_VERSION_NUM >= 140000
+		part_desc = RelationGetPartitionDesc(rel_dst, true);
+#else
+		part_desc = RelationGetPartitionDesc(rel_dst);
+#endif
+		if (part_desc->nparts == 0)
+			ereport(ERROR,
+					(errmsg("table \"%s\" has no partitions", relname_dst)));
+
+		/*
+		 * It's probably not necessary to lock the partitions in exclusive
+		 * mode, but we'll need to open them later. Simply use the exclusive
+		 * lock instead of trying to determine the minimum lock level needed.
+		 */
+		parts_dst = (Relation *) palloc(part_desc->nparts * sizeof(Relation));
+		for (i = 0; i < part_desc->nparts; i++)
+			parts_dst[i] = table_open(part_desc->oids[i],
+									  AccessExclusiveLock);
+	}
 
 	/*
 	 * Build a "historic snapshot", i.e. one that reflect the table state at
@@ -956,9 +983,16 @@ partition_table_impl(char *relschema_src, char *relname_src,
 	 * needed because ExecFindPartition() needs the (root) destination table
 	 * tuple.
 	 */
+	/*
+	 * TODO Allow types to change in the non-partitioning case, as long as
+	 * cast exists. Mention in the documentation that partitioning requires
+	 * match. (Or is it easy enough to allow both partitioning and column type
+	 * change at the same time?)
+	 */
 	check_tup_descs_match(tup_desc_src, RelationGetRelationName(rel_src),
 						  RelationGetDescr(rel_dst),
 						  RelationGetRelationName(rel_dst));
+	/* TODO Why not convert_tuples_by_name() ? */
 	conv_map = convert_tuples_by_position(tup_desc_src,
 										  RelationGetDescr(rel_dst),
 
@@ -996,96 +1030,90 @@ partition_table_impl(char *relschema_src, char *relname_src,
 
 	/*
 	 * Store the identity of the source relation, in order to check that of
-	 * the destination table partitions.
+	 * the destination table (or its partitions).
 	 */
 	ident_src_tupdesc = get_index_tuple_desc(ident_idx_src);
 
-	/*
-	 * Pointers to identity indexes will be looked up by the partition
-	 * relation OID.
-	 */
-	partitions = partitions_create(CurrentMemoryContext, 8, NULL);
-
-	/*
-	 * Gather partition information that we'll need later. It happens here
-	 * because it's a good opportunity to check the partition tuple
-	 * descriptors and identity indexes before the initial load starts. (The
-	 * load does not need those indexes, but it'd be unfortunate to find out
-	 * incorrect or missing identity index after the initial load has been
-	 * performed.)
-	 */
-	for (i = 0; i < part_desc->nparts; i++)
+	/* TODO Move this branch into a function. */
+	if (part_desc)
 	{
-		Oid			ident_idx_dst;
-		Relation	partition = parts_dst[i];
-		Relation	ident_idx_rel;
-		TupleDesc	ident_dst_tupdesc;
-		PartitionEntry *entry;
-		bool		found;
-
-		/* Info on partitions. */
-		entry = partitions_insert(partitions, RelationGetRelid(partition),
-								  &found);
-		Assert(!found);
+		/*
+		 * Pointers to identity indexes will be looked up by the partition
+		 * relation OID.
+		 */
+		partitions = partitions_create(CurrentMemoryContext, 8, NULL);
 
 		/*
-		 * Identity of the rows of a foreign table is hard to implement for
-		 * foreign tables. We'd hit the problem below, but it's clearer to
-		 * report the problem this way.
+		 * Gather partition information that we'll need later. It happens here
+		 * because it's a good opportunity to check the partition tuple
+		 * descriptors and identity indexes before the initial load starts. (The
+		 * load does not need those indexes, but it'd be unfortunate to find out
+		 * incorrect or missing identity index after the initial load has been
+		 * performed.)
 		 */
-		if (partition->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
-			ereport(ERROR,
-					(errmsg("\"%s\" is a foreign table",
-							RelationGetRelationName(partition))));
+		for (i = 0; i < part_desc->nparts; i++)
+		{
+			Relation	partition = parts_dst[i];
+			PartitionEntry *entry;
+			bool		found;
 
-		/*
-		 * Check if the destination table and its partitions have compatible
-		 * type. This should be o.k. for the user because he is expected to
-		 * create the destination table from scratch (i.e. not attaching
-		 * existing tables to the destination table). Otherwise we'd have to
-		 * do additional tuple mapping.
-		 */
-		if (!equal_dest_descs(RelationGetDescr(rel_dst), RelationGetDescr(partition)))
-			elog(ERROR,
-				 "tuple descriptor of partition \"%s\" does not exactly match that of the \"%s\" table",
-				 RelationGetRelationName(partition),
-				 RelationGetRelationName(rel_dst));
+			/* Info on partitions. */
+			entry = partitions_insert(partitions, RelationGetRelid(partition),
+									  &found);
+			Assert(!found);
 
-		ident_idx_dst = RelationGetReplicaIndex(partition);
-		if (!OidIsValid(ident_idx_dst))
-			elog(ERROR, "Identity index missing on partition \"%s\"",
-				 RelationGetRelationName(partition));
-		ident_idx_rel = index_open(ident_idx_dst, AccessShareLock);
+			/*
+			 * Identity of the rows of a foreign table is hard to implement for
+			 * foreign tables. We'd hit the problem below, but it's clearer to
+			 * report the problem this way.
+			 */
+			if (partition->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+				ereport(ERROR,
+						(errmsg("\"%s\" is a foreign table",
+								RelationGetRelationName(partition))));
 
-		ident_dst_tupdesc = CreateTupleDescCopy(RelationGetDescr(ident_idx_rel));
-		if (!equalTupleDescs(ident_dst_tupdesc, ident_src_tupdesc))
-			elog(ERROR,
-				 "identity index on partition \"%s\" does not match that on the source table",
-				 RelationGetRelationName(partition));
-		FreeTupleDesc(ident_dst_tupdesc);
+			/*
+			 * Check if the destination table and its partitions have compatible
+			 * type. This should be o.k. for the user because he is expected to
+			 * create the destination table from scratch (i.e. not attaching
+			 * existing tables to the destination table). Otherwise we'd have to
+			 * do additional tuple mapping.
+			 */
+			if (!equal_dest_descs(RelationGetDescr(rel_dst), RelationGetDescr(partition)))
+				elog(ERROR,
+					 "tuple descriptor of partition \"%s\" does not exactly match that of the \"%s\" table",
+					 RelationGetRelationName(partition),
+					 RelationGetRelationName(rel_dst));
 
-		entry->ident_index = ident_idx_rel;
-		entry->ind_slot = table_slot_create(partition, NULL);
-		/* Expect many insertions. */
-		entry->bistate = GetBulkInsertState();
+			entry->ident_index = get_identity_index(partition,
+													ident_src_tupdesc);
+			entry->ind_slot = table_slot_create(partition, NULL);
+			/* Expect many insertions. */
+			entry->bistate = GetBulkInsertState();
 
-		/*
-		 * Build scan key that we'll use to look for rows to be updated /
-		 * deleted during logical decoding.
-		 *
-		 * As all the partitions have the same identity index, there should
-		 * only be a single identity key.
-		 */
-		if (ident_key == NULL)
-			ident_key = build_identity_key(ident_idx_rel,
-										   &ident_key_nentries);
+			/*
+			 * Build scan key that we'll use to look for rows to be updated /
+			 * deleted during logical decoding.
+			 *
+			 * As all the partitions have the same identity index, there
+			 * should only be a single identity key.
+			 */
+			if (ident_key == NULL)
+				ident_key = build_identity_key(entry->ident_index,
+											   &ident_key_nentries);
+		}
+	}
+	else
+	{
+		ident_index = get_identity_index(rel_dst, ident_src_tupdesc);
+		ident_key = build_identity_key(ident_index, &ident_key_nentries);
+		ind_slot = table_slot_create(rel_dst, NULL);
 	}
 	Assert(ident_key_nentries > 0);
-
 	FreeTupleDesc(ident_src_tupdesc);
 
 	/*
-	 * We need to know whether that no DDL took place that allows for data
+	 * We need to know whether no DDL took place that allows for data
 	 * inconsistency. The source relation was unlocked for some time since
 	 * last check, so pass NoLock.
 	 *
@@ -1103,11 +1131,14 @@ partition_table_impl(char *relschema_src, char *relname_src,
 	 * concurrent changes, which includes UPDATE and DELETE commands?
 	 */
 	mtstate = get_modify_table_state(estate, rel_dst, CMD_INSERT);
+	if (partitions)
+	{
 #if PG_VERSION_NUM >= 140000
-	proute = ExecSetupPartitionTupleRouting(estate, rel_dst);
+		proute = ExecSetupPartitionTupleRouting(estate, rel_dst);
 #else
-	proute = ExecSetupPartitionTupleRouting(estate, mtstate, rel_dst);
+		proute = ExecSetupPartitionTupleRouting(estate, mtstate, rel_dst);
 #endif
+	}
 
 	/*
 	 * The historic snapshot is used to retrieve data w/o concurrent changes.
@@ -1225,6 +1256,8 @@ partition_table_impl(char *relschema_src, char *relname_src,
 										  rel_dst,
 										  ident_key,
 										  ident_key_nentries,
+										  ident_index,
+										  ind_slot,
 										  NoLock,
 										  partitions,
 										  conv_map,
@@ -1264,6 +1297,7 @@ partition_table_impl(char *relschema_src, char *relname_src,
 		if (perform_final_merge(estate, mtstate, proute,
 								relid_src, indexes_src, nindexes,
 								rel_dst, ident_key, ident_key_nentries,
+								ident_index, ind_slot,
 								cat_state, ctx, partitions, conv_map))
 		{
 			source_finalized = true;
@@ -1319,11 +1353,20 @@ partition_table_impl(char *relschema_src, char *relname_src,
 	 * here.
 	 */
 	table_close(rel_dst, AccessExclusiveLock);
-	for (i = 0; i < part_desc->nparts; i++)
-		table_close(parts_dst[i], AccessExclusiveLock);
 
-	pfree(parts_dst);
-	close_partitions(partitions);
+	if (part_desc)
+	{
+		for (i = 0; i < part_desc->nparts; i++)
+			table_close(parts_dst[i], AccessExclusiveLock);
+
+		pfree(parts_dst);
+		close_partitions(partitions);
+	}
+	else
+	{
+		index_close(ident_index, AccessShareLock);
+		ExecDropSingleTupleTableSlot(ind_slot);
+	}
 
 	if (nindexes > 0)
 		pfree(indexes_src);
@@ -1331,12 +1374,42 @@ partition_table_impl(char *relschema_src, char *relname_src,
 	/* State not needed anymore. */
 	free_catalog_state(cat_state);
 
-	ExecCleanupTupleRouting(mtstate, proute);
-	pfree(proute);
+	if (proute)
+	{
+		ExecCleanupTupleRouting(mtstate, proute);
+		pfree(proute);
+	}
 	free_modify_table_state(mtstate);
 	FreeExecutorState(estate);
 	if (conv_map)
 		free_conversion_map(conv_map);
+}
+
+/*
+ * Check if identity index of 'rel' has tuple descriptor equal to 'tup_desc'
+ * and return the index itself.
+ */
+static Relation
+get_identity_index(Relation rel, TupleDesc tup_desc)
+{
+	Oid			index_oid;
+	Relation	index;
+	TupleDesc	index_tupdesc;
+
+	index_oid = RelationGetReplicaIndex(rel);
+	if (!OidIsValid(index_oid))
+		elog(ERROR, "Identity index missing on table \"%s\"",
+			 RelationGetRelationName(rel));
+	index = index_open(index_oid, AccessShareLock);
+
+	index_tupdesc = CreateTupleDescCopy(RelationGetDescr(index));
+	if (!equalTupleDescs(index_tupdesc, tup_desc))
+		elog(ERROR,
+			 "identity index on table \"%s\" does not match that on the source table",
+			 RelationGetRelationName(rel));
+	FreeTupleDesc(index_tupdesc);
+
+	return index;
 }
 
 static int
@@ -1369,7 +1442,7 @@ check_prerequisites(Relation rel)
 	if (form->relkind == RELKIND_PARTITIONED_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("cannot process partitioned table")));
+				 errmsg("the source table may not be partitioned")));
 
 	if (form->relkind != RELKIND_RELATION)
 		ereport(ERROR,
@@ -1418,7 +1491,7 @@ check_prerequisites(Relation rel)
 	 * have got XID assigned, causing setup_decoding() to fail later), open
 	 * cursor might be. See comments of the function for details.
 	 */
-	CheckTableNotInUse(rel, "partition_table()");
+	CheckTableNotInUse(rel, "rewrite_table()");
 }
 
 /*
@@ -3240,6 +3313,7 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 	TupleTableSlot *slot_src,
 			   *slot_dst;
 	HeapTuple  *tuples = NULL;
+	BulkInsertState	bistate_nonpart = NULL;
 	MemoryContext load_cxt,
 				old_cxt;
 	XLogRecPtr	end_of_wal_prev = InvalidXLogRecPtr;
@@ -3275,6 +3349,13 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 	 */
 	slot_dst = MakeSingleTupleTableSlot(RelationGetDescr(rel_dst),
 										&TTSOpsHeapTuple);
+
+	/*
+	 * If the table is partitioned, each partition has a separate instance of
+	 * BulkInsertState. Otherwise we need to allocate one here.
+	 */
+	if (proute == NULL)
+		bistate_nonpart = GetBulkInsertState();
 
 	/*
 	 * Store as much data as we can store in memory. The more memory is
@@ -3471,6 +3552,7 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 		{
 			HeapTuple	tup_out;
 			ResultRelInfo *rri;
+			Relation	rel_ins;
 			List	   *recheck;
 			BulkInsertState bistate;
 
@@ -3488,12 +3570,27 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 			if (conv_map)
 				tup_out = convert_tuple_for_dest_table(tup_out, conv_map);
 			ExecStoreHeapTuple(tup_out, slot_dst, false);
-			/* Find out which partition the tuple belongs to. */
-			rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-									proute, slot_dst, estate);
+
+			if (proute)
+			{
+				/* Find out which partition the tuple belongs to. */
+				rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
+										proute, slot_dst, estate);
+
+				rel_ins = rri->ri_RelationDesc;
+				bistate = get_partition_insert_state(partitions,
+													 RelationGetRelid(rri->ri_RelationDesc));
+			}
+			else
+			{
+				/* Non-partitioned table. */
+				rri = mtstate->resultRelInfo;
+				rel_ins = rel_dst;
+				bistate = bistate_nonpart;
+			}
 
 			/*
-			 * Insert the tuple into the partition.
+			 * Insert the tuple into the relation (or partition).
 			 *
 			 * XXX Should this happen outside load_cxt? Currently "bistate" is
 			 * a flat object (i.e. it does not point to any memory chunk that
@@ -3501,11 +3598,9 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 			 * and thus the cleanup between batches should not damage it, but
 			 * can't it get more complex in future PG versions?
 			 */
-			bistate = get_partition_insert_state(partitions,
-												 RelationGetRelid(rri->ri_RelationDesc));
 			Assert(bistate != NULL);
-			table_tuple_insert(rri->ri_RelationDesc, slot_dst,
-							   GetCurrentCommandId(true), 0, bistate);
+			table_tuple_insert(rel_ins, slot_dst, GetCurrentCommandId(true),
+							   0, bistate);
 
 #if PG_VERSION_NUM < 140000
 			estate->es_result_relation_info = rri;
@@ -3588,6 +3683,8 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 	table_endscan(heap_scan);
 	ExecDropSingleTupleTableSlot(slot_src);
 	ExecDropSingleTupleTableSlot(slot_dst);
+	if (bistate_nonpart)
+		FreeBulkInsertState(bistate_nonpart);
 
 	/* Drop the replication origin. */
 #if PG_VERSION_NUM >= 140000
@@ -3670,6 +3767,8 @@ perform_final_merge(EState *estate,
 					Oid relid_src, Oid *indexes_src, int nindexes,
 					Relation rel_dst, ScanKey ident_key,
 					int ident_key_nentries,
+					Relation ident_index,
+					TupleTableSlot	*ind_slot,
 					CatalogState *cat_state,
 					LogicalDecodingContext *ctx,
 					partitions_hash *partitions,
@@ -3805,6 +3904,8 @@ perform_final_merge(EState *estate,
 													rel_dst,
 													ident_key,
 													ident_key_nentries,
+													ident_index,
+													ind_slot,
 													AccessExclusiveLock,
 													partitions,
 													conv_map,
@@ -3834,6 +3935,8 @@ perform_final_merge(EState *estate,
 											  rel_dst,
 											  ident_key,
 											  ident_key_nentries,
+											  ident_index,
+											  ind_slot,
 											  AccessExclusiveLock,
 											  partitions,
 											  conv_map,
