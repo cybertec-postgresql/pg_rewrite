@@ -292,6 +292,41 @@ typedef struct WorkerTask
 /* Each backend stores here the pointer to its task in the shared memory. */
 extern WorkerTask *MyWorkerTask;
 
+/*
+ * Like AttrMap in PG core, but here we add an array of expressions to coerce
+ * the input values to output ones. (A new name is needed as it's hard to
+ * avoid inclusion of the in-core structure.)
+ */
+typedef struct AttrMapExt
+{
+	AttrNumber *attnums;
+	int			maplen;
+	Node	**coerceExprs;	/* Non-NULL field tells how to convert the input
+							 * value to the output data type. NULL indicates
+							 * that no conversion is needed. */
+} AttrMapExt;
+
+/*
+ * Like TupleConversionMap in PG core, but here we add an array of expressions
+ * to coerce the input values to output ones. (A new name is needed as it's
+ * hard to avoid inclusion of the in-core structure.)
+ */
+typedef struct TupleConversionMapExt
+{
+	TupleDesc	indesc;			/* tupdesc for source rowtype */
+	TupleDesc	outdesc;		/* tupdesc for result rowtype */
+	AttrMapExt    *attrMap;		/* indexes of input fields, or 0 for null */
+	Datum	   *invalues;		/* workspace for deconstructing source */
+	bool	   *inisnull;
+	Datum	   *outvalues;		/* workspace for constructing result */
+	bool	   *outisnull;
+	ExprState	**coerceExprs;	/* See AttrMapExt */
+	EState		*estate;		/* Executor state used to evaluate
+								 * coerceExprs. */
+	TupleTableSlot *in_slot;	/* Slot to store the input tuple for
+								 * coercion. */
+} TupleConversionMapExt;
+
 extern PGDLLEXPORT void rewrite_worker_main(Datum main_arg);
 
 extern void pg_rewrite_exit_if_requested(void);
@@ -316,13 +351,15 @@ extern bool pg_rewrite_process_concurrent_changes(EState *estate,
 												  TupleTableSlot *ind_slot,
 												  LOCKMODE lock_held,
 												  partitions_hash *partitions,
-												  TupleConversionMap *conv_map,
+												  TupleConversionMapExt *conv_map,
 												  struct timeval *must_complete);
 extern bool pg_rewrite_decode_concurrent_changes(LogicalDecodingContext *ctx,
 												 XLogRecPtr end_of_wal,
 												 struct timeval *must_complete);
 extern HeapTuple convert_tuple_for_dest_table(HeapTuple tuple,
-											  TupleConversionMap *conv_map);
+											  TupleConversionMapExt *conv_map);
 extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);
 extern BulkInsertState get_partition_insert_state(partitions_hash *partitions,
 												  Oid part_oid);;
+extern HeapTuple pg_rewrite_execute_attr_map_tuple(HeapTuple tuple,
+												   TupleConversionMapExt *map);

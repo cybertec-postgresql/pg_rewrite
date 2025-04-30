@@ -28,7 +28,7 @@ static void apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 									 Relation ident_index,
 									 TupleTableSlot	*ind_slot,
 									 partitions_hash *partitions,
-									 TupleConversionMap *conv_map);
+									 TupleConversionMapExt *conv_map);
 static void find_tuple_in_partition(HeapTuple tup, Relation partition,
 									partitions_hash *partitions,
 									ScanKey key, int nkeys, ItemPointer ctid);
@@ -74,7 +74,7 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 									  TupleTableSlot *ind_slot,
 									  LOCKMODE lock_held,
 									  partitions_hash *partitions,
-									  TupleConversionMap *conv_map,
+									  TupleConversionMapExt *conv_map,
 									  struct timeval *must_complete)
 {
 	DecodingOutputState *dstate;
@@ -211,7 +211,7 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 						 Relation ident_index,
 						 TupleTableSlot	*ind_slot,
 						 partitions_hash *partitions,
-						 TupleConversionMap *conv_map)
+						 TupleConversionMapExt *conv_map)
 {
 	TupleTableSlot *slot;
 	BulkInsertState	bistate_nonpart = NULL;
@@ -224,7 +224,9 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 	if (proute == NULL)
 		bistate_nonpart = GetBulkInsertState();
 
-	/* TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples(). */
+	/*
+	 * TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples().
+	 */
 	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsHeapTuple);
 
 	/*
@@ -620,11 +622,11 @@ processing_time_elapsed(struct timeval *utmost)
  */
 HeapTuple
 convert_tuple_for_dest_table(HeapTuple tuple,
-							 TupleConversionMap *conv_map)
+							 TupleConversionMapExt *conv_map)
 {
 	HeapTuple	orig = tuple;
 
-	tuple = execute_attr_map_tuple(tuple, conv_map);
+	tuple = pg_rewrite_execute_attr_map_tuple(tuple, conv_map);
 	pfree(orig);
 
 	return tuple;

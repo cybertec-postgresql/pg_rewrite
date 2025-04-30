@@ -44,7 +44,10 @@
 #include "lib/stringinfo.h"
 #include "nodes/primnodes.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "parser/parse_coerce.h"
+#include "parser/parse_collate.h"
 #include "replication/snapbuild.h"
 #include "partitioning/partdesc.h"
 #include "storage/bufmgr.h"
@@ -74,7 +77,7 @@ PG_MODULE_MAGIC;
 static void rewrite_table_impl(char *relschema_src, char *relname_src,
 							   char *relname_new, char *relschema_dst,
 							   char *relname_dst);
-static Relation get_identity_index(Relation rel, TupleDesc tup_desc);
+static Relation get_identity_index(Relation rel_dst, TupleDesc tupdesc_src);
 static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* The WAL segment being decoded. */
@@ -128,8 +131,6 @@ static IndexCatInfo *get_index_info(Oid relid, int *relninds,
 									bool *found_invalid,
 									bool invalid_check_only,
 									bool *found_pk);
-static void check_tup_descs_match(TupleDesc tupdesc_src, char *tabname_src,
-								  TupleDesc tupdesc_dst, char *tabname_dst);
 static bool equal_op_expressions(char *expr_str1, char *expr_str2);
 static bool is_rel_referenced(Relation rel);
 static void compare_constraints(Relation rel1, Relation rel2);
@@ -140,10 +141,6 @@ static ConstraintInfo **get_relation_constraints_array(List *all,
 													   char contype,
 													   int n);
 static bool equal_dest_descs(TupleDesc tupdesc1, TupleDesc tupdesc2);
-static void report_tupdesc_mismatch(const char *desc,
-									char *attname, char *tabname_src,
-									bool has_src, char *tabname_dst,
-									bool has_dst);
 static TupleDesc get_index_tuple_desc(Oid ind_oid);
 static ModifyTableState *get_modify_table_state(EState *estate, Relation rel,
 												CmdType operation);
@@ -160,7 +157,7 @@ static void perform_initial_load(EState *estate, ModifyTableState *mtstate,
 								 Relation rel_dst,
 								 partitions_hash *partitions,
 								 LogicalDecodingContext *ctx,
-								 TupleConversionMap *conv_map);
+								 TupleConversionMapExt *conv_map);
 static ScanKey build_identity_key(Relation ident_idx_rel, int *nentries);
 static bool perform_final_merge(EState *estate,
 								ModifyTableState *mtstate,
@@ -173,8 +170,23 @@ static bool perform_final_merge(EState *estate,
 								CatalogState *cat_state,
 								LogicalDecodingContext *ctx,
 								partitions_hash *ident_indexes,
-								TupleConversionMap *conv_map);
+								TupleConversionMapExt *conv_map);
 static void close_partitions(partitions_hash *partitions);
+
+static TupleConversionMapExt *convert_tuples_by_name_ext(TupleDesc indesc,
+														 TupleDesc outdesc);
+static AttrMapExt *make_attrmap_ext(int maplen);
+static void free_attrmap_ext(AttrMapExt *map);
+static AttrMapExt *build_attrmap_by_name_if_req_ext(TupleDesc indesc,
+													TupleDesc outdesc);
+static AttrMapExt *build_attrmap_by_name_ext(TupleDesc indesc,
+											 TupleDesc outdesc);
+static bool check_attrmap_match_ext(TupleDesc indesc, TupleDesc outdesc,
+									AttrMapExt *attrMap);
+static TupleConversionMapExt *convert_tuples_by_name_attrmap_ext(TupleDesc indesc,
+																 TupleDesc outdesc,
+																 AttrMapExt *attrMap);
+static void free_conversion_map_ext(TupleConversionMapExt *map);
 
 /*
  * Should it be checked whether constraints on the destination table match
@@ -821,7 +833,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	bool		source_finalized;
 	Relation   *parts_dst = NULL;
 	partitions_hash *partitions = NULL;
-	TupleConversionMap *conv_map;
+	TupleConversionMapExt *conv_map;
 	EState	   *estate;
 	ModifyTableState *mtstate;
 	struct PartitionTupleRouting *proute = NULL;
@@ -871,8 +883,11 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 
 	/*
 	 * Info to initialize the tuplestore we'll use during logical decoding.
+	 *
+	 * Copy is needed because we'll close the relation before using the tuple
+	 * descriptor.
 	 */
-	tup_desc_src = CreateTupleDescCopyConstr(RelationGetDescr(rel_src));
+	tup_desc_src = CreateTupleDescCopy(RelationGetDescr(rel_src));
 
 	/*
 	 * Get ready for the subsequent calls of
@@ -979,28 +994,18 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	rel_src = table_open(relid_src, AccessShareLock);
 
 	/*
-	 * Check if the source and destination table have compatible type. This is
-	 * needed because ExecFindPartition() needs the (root) destination table
-	 * tuple.
+	 * Create a conversion map so that we can handle difference(s) in the
+	 * tuple descriptor. Note that a copy is passed to 'indesc' since the map
+	 * contains a tuple slot based on this descriptor and since 'rel_src' will
+	 * be closed and re-opened (in order to acquire AccessExclusiveLock)
+	 * before the last use of 'conv_map'.
 	 */
 	/*
-	 * TODO Allow types to change in the non-partitioning case, as long as
-	 * cast exists. Mention in the documentation that partitioning requires
-	 * match. (Or is it easy enough to allow both partitioning and column type
-	 * change at the same time?)
+	 * TODO Say in documentation that the destination table must have the same
+	 * constraints as the source. (Also explain how to treat FK constraints.)
 	 */
-	check_tup_descs_match(tup_desc_src, RelationGetRelationName(rel_src),
-						  RelationGetDescr(rel_dst),
-						  RelationGetRelationName(rel_dst));
-	/* TODO Why not convert_tuples_by_name() ? */
-	conv_map = convert_tuples_by_position(tup_desc_src,
-										  RelationGetDescr(rel_dst),
-
-										  /*
-										   * XXX Better log message? User
-										   * shouldn't see this anyway.
-										   */
-										  "cannot map tuples");
+	conv_map = convert_tuples_by_name_ext(CreateTupleDescCopy(RelationGetDescr(rel_src)),
+										  RelationGetDescr(rel_dst));
 
 	/*
 	 * Check if the source table has all the constraints that the destination
@@ -1382,34 +1387,60 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	free_modify_table_state(mtstate);
 	FreeExecutorState(estate);
 	if (conv_map)
-		free_conversion_map(conv_map);
+		free_conversion_map_ext(conv_map);
 }
 
 /*
- * Check if identity index of 'rel' has tuple descriptor equal to 'tup_desc'
- * and return the index itself.
+ * Check if identity index of 'rel_dest' has tuple descriptor that matches
+ * 'tupdesc_src' and return the index.
  */
 static Relation
-get_identity_index(Relation rel, TupleDesc tup_desc)
+get_identity_index(Relation rel_dst, TupleDesc tupdesc_src)
 {
-	Oid			index_oid;
-	Relation	index;
-	TupleDesc	index_tupdesc;
+	Oid			index_dst_oid;
+	Relation	index_dst;
+	TupleDesc	tupdesc_dst;
+	bool		match = true;
 
-	index_oid = RelationGetReplicaIndex(rel);
-	if (!OidIsValid(index_oid))
+	index_dst_oid = RelationGetReplicaIndex(rel_dst);
+	if (!OidIsValid(index_dst_oid))
 		elog(ERROR, "Identity index missing on table \"%s\"",
-			 RelationGetRelationName(rel));
-	index = index_open(index_oid, AccessShareLock);
+			 RelationGetRelationName(rel_dst));
+	index_dst = index_open(index_dst_oid, AccessShareLock);
+	tupdesc_dst = RelationGetDescr(index_dst);
 
-	index_tupdesc = CreateTupleDescCopy(RelationGetDescr(index));
-	if (!equalTupleDescs(index_tupdesc, tup_desc))
+	/*
+	 * The tuple descriptors might not be equal, since some attributes of
+	 * rel_dst can have different types. What should match though is attribute
+	 * names and their order.
+	 */
+	if (tupdesc_src->natts != tupdesc_dst->natts)
+		match = false;
+	else
+	{
+		for (int i = 0; i < tupdesc_src->natts; i++)
+		{
+			Form_pg_attribute att_src = TupleDescAttr(tupdesc_src, i);
+			Form_pg_attribute att_dst = TupleDescAttr(tupdesc_dst, i);
+
+			/* Indexes should not have dropped attributes. */
+			Assert(!att_src->attisdropped);
+			Assert(!att_dst->attisdropped);
+
+			if (strcmp(NameStr(att_src->attname), NameStr(att_dst->attname)) != 0)
+			{
+				match = false;
+				break;
+			}
+		}
+	}
+
+	if (!match)
 		elog(ERROR,
 			 "identity index on table \"%s\" does not match that on the source table",
-			 RelationGetRelationName(rel));
-	FreeTupleDesc(index_tupdesc);
+			 RelationGetRelationName(rel_dst));
 
-	return index;
+	return index_dst;
 }
 
 static int
@@ -2073,237 +2104,6 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	return result;
 }
 
-/*
- * Check if the tuple descriptors are at least as similar that tupconvert.c
- * can handle conversion from tupdesc_src to tupdesc_dst.
- *
- * Derived from equalTupleDescs(), therefore check that function in PG core
- * when adapting the code to the next PG version.
- */
-static void
-check_tup_descs_match(TupleDesc tupdesc_src, char *tabname_src,
-					  TupleDesc tupdesc_dst, char *tabname_dst)
-{
-	int			n_src = tupdesc_src->natts;
-	int			n_dst = tupdesc_dst->natts;
-	AttrNumber *valid_src,
-			   *valid_dst;
-	AttrNumber	nvalid_src,
-				nvalid_dst;
-	int			i;
-
-	/* Gather non-dropped columns. */
-	valid_src = (AttrNumber *) palloc(n_src * sizeof(AttrNumber));
-	nvalid_src = 0;
-	for (i = 0; i < n_src; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc_src, i);
-
-		if (!attr->attisdropped)
-			valid_src[nvalid_src++] = i;
-	}
-
-	valid_dst = (AttrNumber *) palloc(n_dst * sizeof(AttrNumber));
-	nvalid_dst = 0;
-	for (i = 0; i < n_dst; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc_dst, i);
-
-		if (!attr->attisdropped)
-			valid_dst[nvalid_dst++] = i;
-	}
-
-	if (nvalid_src != nvalid_dst)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 (errmsg("relation \"%s\" has different number of columns than relation \"%s\"",
-						 tabname_src, tabname_dst))));
-
-	for (i = 0; i < nvalid_src; i++)
-	{
-		Form_pg_attribute attr1 = TupleDescAttr(tupdesc_src, valid_src[i]);
-		Form_pg_attribute attr2 = TupleDescAttr(tupdesc_dst, valid_dst[i]);
-
-		/*
-		 * XXX Is it worth the effort to allow the tupdesc_dst to have
-		 * different ordering of columns from tupdesc_src? The user might want
-		 * to take the opportunity and reduce padding. If allowing different
-		 * order, adjust compare_constraints().
-		 */
-		if (strcmp(NameStr(attr1->attname), NameStr(attr2->attname)) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-					 errmsg("no match found for the \"%s\" column of the \"%s\" table",
-							NameStr(attr1->attname), tabname_src),
-					 errhint("the source and destination table should have the same column ordering")));
-		if (attr1->atttypid != attr2->atttypid ||
-			attr1->attlen != attr2->attlen ||
-			attr1->attndims != attr2->attndims ||
-			attr1->atttypmod != attr2->atttypmod ||
-			attr1->attbyval != attr2->attbyval ||
-			attr1->attalign != attr2->attalign)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("data type of the \"%s\" column of the \"%s\" table does not match the data type of the \"%s\" column of the \"%s\" table",
-							NameStr(attr1->attname),
-							tabname_src,
-							NameStr(attr2->attname),
-							tabname_dst)));
-
-		if (attr1->attstorage != attr2->attstorage)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("storage of the \"%s\" column of the \"%s\" table does not match the storage of the \"%s\" column of the \"%s\" table",
-							NameStr(attr1->attname),
-							tabname_src,
-							NameStr(attr2->attname),
-							tabname_dst)));
-#if PG_VERSION_NUM >= 140000
-		if (attr1->attcompression != attr2->attcompression)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("compression of the \"%s\" column of the \"%s\" table does not match the compression of the \"%s\" column of the \"%s\" table",
-							NameStr(attr1->attname),
-							tabname_src,
-							NameStr(attr2->attname),
-							tabname_dst)));
-#endif
-
-		/*
-		 * XXX Allow the case where the source table does have NOT NULL while
-		 * destination does not?
-		 */
-		if (attr1->attnotnull != attr2->attnotnull)
-			report_tupdesc_mismatch("NOT NULL constraint",
-									NameStr(attr1->attname),
-									tabname_src,
-									attr1->attnotnull,
-									tabname_dst,
-									attr2->attnotnull);
-
-		/*
-		 * XXX Allow the case where the source table does not have the default
-		 * value destination does?
-		 */
-		if (attr1->atthasdef != attr2->atthasdef)
-			report_tupdesc_mismatch("DEFAULT value",
-									NameStr(attr1->attname),
-									tabname_src,
-									attr1->atthasdef,
-									tabname_dst,
-									attr2->atthasdef);
-
-		/*
-		 * Change of the way value is generated between the source and the
-		 * destination table should not make an *existing* source tuple
-		 * incompatible with the destination table, however if attidentity or
-		 * attgenerated is different, user might end up being unable to insert
-		 * new rows into the destination table (because the new expression can
-		 * generate values that e.g. break CHECK constraint). That should be
-		 * easy for the user to fix, but it's also easy for us to check.
-		 */
-		if (attr1->attidentity != attr2->attidentity ||
-			attr1->attgenerated != attr2->attgenerated)
-			ereport(ERROR,
-					(errmsg("value of the \"%s\" column of the \"%s\" table is generated in a different way than the value for the \"%s\" table",
-							NameStr(attr1->attname), tabname_src,
-							tabname_dst)));
-
-		/*
-		 * Collation needs to match so that the identity indexes on both
-		 * source and destination table can have the same definition.
-		 */
-		if (attr1->attcollation != attr2->attcollation)
-			ereport(ERROR,
-					(errcode(ERRCODE_COLLATION_MISMATCH),
-					 errmsg("collation of the \"%s\" column of the \"%s\" table does not match the collation of the \"%s\" column of the \"%s\" table",
-							NameStr(attr1->attname),
-							tabname_src,
-							NameStr(attr2->attname),
-							tabname_dst)));
-	}
-
-	if (!rewrite_check_constraints)
-		return;
-
-	if (tupdesc_src->constr != NULL)
-	{
-		TupleConstr *constr_src = tupdesc_src->constr;
-		TupleConstr *constr_dst = tupdesc_dst->constr;
-		int			n;
-
-		if (constr_dst == NULL)
-			report_tupdesc_mismatch("constraints",
-									NULL,
-									tabname_src,
-									true,
-									tabname_dst,
-									false);
-
-		/*
-		 * Given the check of attnotnull above, Assert() would make sense here
-		 * but there's none in the equalTupleDescs() function in PG core
-		 */
-		if (constr_src->has_not_null != constr_dst->has_not_null)
-			report_tupdesc_mismatch("NOT NULL constraint",
-									NULL,
-									tabname_src,
-									constr_src->has_not_null,
-									tabname_dst,
-									constr_dst->has_not_null);
-		/* Likewise, Assert() would make sense here. */
-		if (constr_src->has_generated_stored != constr_dst->has_generated_stored)
-			report_tupdesc_mismatch("generated stored column",
-									NULL,
-									tabname_src,
-									constr_src->has_generated_stored,
-									tabname_dst,
-									constr_dst->has_generated_stored);
-
-		/*
-		 * XXX It should be o.k. to allow the destination table to have extra
-		 * CHECK expressions.
-		 */
-		n = constr_src->num_defval;
-		if (n != (int) constr_dst->num_defval)
-			ereport(ERROR,
-					(errmsg("table \"%s\" has different number of DEFAULT expressions than table \"%s\"",
-							tabname_src, tabname_dst)));
-
-		n = constr_src->num_check;
-		if (n != (int) constr_dst->num_check)
-			ereport(ERROR,
-					(errmsg("table \"%s\" has a different set of CHECK constraints than table \"%s\"",
-							tabname_src, tabname_dst)));
-
-		/*
-		 * Similarly, we rely here on the ConstrCheck entries being sorted by
-		 * name. If there are duplicate names, the outcome of the comparison
-		 * is uncertain, but that should not happen.
-		 */
-		for (i = 0; i < n; i++)
-		{
-			ConstrCheck *check1 = constr_src->check + i;
-			ConstrCheck *check2 = constr_dst->check + i;
-
-			if (!(equal_op_expressions(check1->ccbin, check2->ccbin) &&
-				  check1->ccvalid == check2->ccvalid &&
-				  check1->ccnoinherit == check2->ccnoinherit))
-				ereport(ERROR,
-						(errmsg("table \"%s\" has a different set of CHECK constraints than table \"%s\"",
-								tabname_src, tabname_dst)));
-		}
-	}
-	else if (tupdesc_dst->constr != NULL)
-		report_tupdesc_mismatch("constraints",
-								NULL,
-								tabname_src,
-								false,
-								tabname_dst,
-								true);
-
-}
-
 /* Compare expressions for which string comparison would not work.*/
 static bool
 equal_op_expressions(char *expr_str1, char *expr_str2)
@@ -2878,34 +2678,6 @@ equal_dest_descs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 	return true;
 }
 
-/*
- * Report mismatch between tuples or, if attname==NULL, between specific
- * columns.
- */
-static void
-report_tupdesc_mismatch(const char *desc, char *attname,
-						char *tabname_src, bool has_src,
-						char *tabname_dst, bool has_dst)
-{
-	char	   *does,
-			   *does_not;
-
-	Assert(has_src != has_dst);
-
-	does = has_src ? tabname_src : tabname_dst;
-	does_not = has_dst ? tabname_src : tabname_dst;
-
-	/* XXX What's the best errcode here? */
-	if (attname)
-		ereport(ERROR,
-				(errmsg("\"%s\" column of the \"%s\" table does have %s but \"%s\" column of the \"%s\" table does not",
-						attname, does, desc, attname, does_not)));
-	else
-		ereport(ERROR,
-				(errmsg("the \"%s\" table does have %s but the \"%s\" table does not",
-						does, desc, does_not)));
-}
-
 static TupleDesc
 get_index_tuple_desc(Oid ind_oid)
 {
@@ -3303,7 +3075,7 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 					 Relation rel_src, Snapshot snap_hist, Relation rel_dst,
 					 partitions_hash *partitions,
 					 LogicalDecodingContext *ctx,
-					 TupleConversionMap *conv_map)
+					 TupleConversionMapExt *conv_map)
 {
 	int			batch_size,
 				batch_max_size;
@@ -3772,7 +3544,7 @@ perform_final_merge(EState *estate,
 					CatalogState *cat_state,
 					LogicalDecodingContext *ctx,
 					partitions_hash *partitions,
-					TupleConversionMap *conv_map)
+					TupleConversionMapExt *conv_map)
 {
 	Relation	rel_src;
 	bool		success;
@@ -3982,6 +3754,366 @@ get_partition_insert_state(partitions_hash *partitions, Oid part_oid)
 
 	return entry->bistate;
 }
+
+/*
+ * Like make_attrmap() in PG core, but return AttrMapExt.
+ */
+static AttrMapExt *
+make_attrmap_ext(int maplen)
+{
+	AttrMapExt    *res;
+
+	res = (AttrMapExt *) palloc0(sizeof(AttrMapExt));
+	res->maplen = maplen;
+	res->attnums = (AttrNumber *) palloc0(sizeof(AttrNumber) * maplen);
+	res->coerceExprs = palloc0_array(Node *, maplen);
+	return res;
+}
+
+static void
+free_attrmap_ext(AttrMapExt *map)
+{
+	pfree(map->attnums);
+	pfree(map->coerceExprs);
+	pfree(map);
+}
+
+
+/*
+ * Like convert_tuples_by_name() in PG core, but try to coerce if the input
+ * and output types differ.
+ */
+static TupleConversionMapExt *
+convert_tuples_by_name_ext(TupleDesc indesc,
+						   TupleDesc outdesc)
+{
+	AttrMapExt    *attrMap;
+
+	/* Verify compatibility and prepare attribute-number map */
+	attrMap = build_attrmap_by_name_if_req_ext(indesc, outdesc);
+
+	if (attrMap == NULL)
+	{
+		/* runtime conversion is not needed */
+		return NULL;
+	}
+
+	return convert_tuples_by_name_attrmap_ext(indesc, outdesc, attrMap);
+}
+
+/*
+ * Like build_attrmap_by_name_if_req() in PG core, but try to coerce if the
+ * input and output types differ.
+ */
+static AttrMapExt *
+build_attrmap_by_name_if_req_ext(TupleDesc indesc,
+								 TupleDesc outdesc)
+{
+	AttrMapExt    *attrMap;
+
+	/* Verify compatibility and prepare attribute-number map */
+	attrMap = build_attrmap_by_name_ext(indesc, outdesc);
+
+	/*
+	 * Check if the map has a one-to-one match and if there's any coercion.
+	 */
+	if (check_attrmap_match_ext(indesc, outdesc, attrMap))
+	{
+		/* Runtime conversion is not needed */
+		free_attrmap_ext(attrMap);
+		return NULL;
+	}
+
+	return attrMap;
+}
+
+/*
+ * Like build_attrmap_by_name() in PG core but try to coerce if the input and
+ * output types differ.
+ */
+static AttrMapExt *
+build_attrmap_by_name_ext(TupleDesc indesc,
+						  TupleDesc outdesc)
+{
+	AttrMapExt    *attrMap;
+	int			outnatts;
+	int			innatts;
+	int			i;
+	int			nextindesc = -1;
+
+	outnatts = outdesc->natts;
+	innatts = indesc->natts;
+
+	attrMap = make_attrmap_ext(outnatts);
+	for (i = 0; i < outnatts; i++)
+	{
+		Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
+		char	   *attname;
+		Oid			atttypid;
+		int32		atttypmod;
+		int			j;
+
+		if (outatt->attisdropped)
+			continue;			/* attrMap->attnums[i] is already 0 */
+		attname = NameStr(outatt->attname);
+		atttypid = outatt->atttypid;
+		atttypmod = outatt->atttypmod;
+
+		/*
+		 * Now search for an attribute with the same name in the indesc. It
+		 * seems likely that a partitioned table will have the attributes in
+		 * the same order as the partition, so the search below is optimized
+		 * for that case.  It is possible that columns are dropped in one of
+		 * the relations, but not the other, so we use the 'nextindesc'
+		 * counter to track the starting point of the search.  If the inner
+		 * loop encounters dropped columns then it will have to skip over
+		 * them, but it should leave 'nextindesc' at the correct position for
+		 * the next outer loop.
+		 */
+		for (j = 0; j < innatts; j++)
+		{
+			Form_pg_attribute inatt;
+
+			nextindesc++;
+			if (nextindesc >= innatts)
+				nextindesc = 0;
+
+			inatt = TupleDescAttr(indesc, nextindesc);
+			if (inatt->attisdropped)
+				continue;
+			if (strcmp(attname, NameStr(inatt->attname)) == 0)
+			{
+				/* Found it, check type */
+				if (atttypid != inatt->atttypid || atttypmod != inatt->atttypmod)
+				{
+					Node	*expr;
+					ParseState *pstate = make_parsestate(NULL);
+
+					/*
+					 * Can the input attribute be coerced to the output one?
+					 *
+					 * TODO Hard-wire data types for which we are sure that FK
+					 * validation can be skipped.
+					 *
+					 * XXX Currently we follow ATPrepAlterColumnType() in PG
+					 * core - should anything be different?
+					 */
+					expr = (Node *) makeVar(1, inatt->attnum,
+											inatt->atttypid, inatt->atttypmod,
+											inatt->attcollation,
+											0);
+					expr = coerce_to_target_type(pstate,
+												 expr, exprType(expr),
+												 outatt->atttypid,
+												 outatt->atttypmod,
+												 COERCION_ASSIGNMENT,
+												 COERCE_IMPLICIT_CAST,
+												 -1);
+
+					if (expr)
+					{
+						assign_expr_collations(pstate, expr);
+						attrMap->coerceExprs[i] = expr;
+					}
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_DATATYPE_MISMATCH),
+								 errmsg("could not convert row type"),
+								 errdetail("Attribute \"%s\" of type %s does not match corresponding attribute of type %s.",
+										   attname,
+										   format_type_be(outdesc->tdtypeid),
+										   format_type_be(indesc->tdtypeid))));
+				}
+				attrMap->attnums[i] = inatt->attnum;
+				break;
+			}
+		}
+		if (attrMap->attnums[i] == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("could not convert row type"),
+					 errdetail("Attribute \"%s\" of type %s does not exist in type %s.",
+							   attname,
+							   format_type_be(outdesc->tdtypeid),
+							   format_type_be(indesc->tdtypeid))));
+	}
+	return attrMap;
+}
+
+/*
+ * check_attrmap_match() copied from PG core and adjusted so it takes coercion
+ * into account.
+ */
+static bool
+check_attrmap_match_ext(TupleDesc indesc,
+						TupleDesc outdesc,
+						AttrMapExt *attrMap)
+{
+	int			i;
+
+	/* no match if attribute numbers are not the same */
+	if (indesc->natts != outdesc->natts)
+		return false;
+
+	/* no match if there is at least one coercion expression */
+	for (i = 0; i < attrMap->maplen; i++)
+	{
+		if (attrMap->coerceExprs[i])
+			return false;
+	}
+
+	for (i = 0; i < attrMap->maplen; i++)
+	{
+		Form_pg_attribute inatt = TupleDescAttr(indesc, i);
+		Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
+
+		/*
+		 * If the input column has a missing attribute, we need a conversion.
+		 */
+		if (inatt->atthasmissing)
+			return false;
+
+		if (attrMap->attnums[i] == (i + 1))
+			continue;
+
+		/*
+		 * If it's a dropped column and the corresponding input column is also
+		 * dropped, we don't need a conversion.  However, attlen and attalign
+		 * must agree.
+		 */
+		if (attrMap->attnums[i] == 0 &&
+			inatt->attisdropped &&
+			inatt->attlen == outatt->attlen &&
+			inatt->attalign == outatt->attalign)
+			continue;
+
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * Like convert_tuples_by_name_attrmap() but handle coerce expressions.
+ */
+static TupleConversionMapExt *
+convert_tuples_by_name_attrmap_ext(TupleDesc indesc,
+								   TupleDesc outdesc,
+								   AttrMapExt *attrMap)
+{
+	int			n = outdesc->natts;
+	TupleConversionMapExt *map;
+	EState *estate;
+
+	Assert(attrMap != NULL);
+
+	/* Prepare the map structure */
+	map = (TupleConversionMapExt *) palloc(sizeof(TupleConversionMapExt));
+	map->indesc = indesc;
+	map->outdesc = outdesc;
+	map->attrMap = attrMap;
+	/* preallocate workspace for Datum arrays */
+	map->outvalues = (Datum *) palloc(n * sizeof(Datum));
+	map->outisnull = (bool *) palloc(n * sizeof(bool));
+	n = indesc->natts + 1;		/* +1 for NULL */
+	map->invalues = (Datum *) palloc(n * sizeof(Datum));
+	map->inisnull = (bool *) palloc(n * sizeof(bool));
+	map->invalues[0] = (Datum) 0;	/* set up the NULL entry */
+	map->inisnull[0] = true;
+
+	map->coerceExprs = (ExprState **) palloc0_array(ExprState *, n);
+	estate = CreateExecutorState();
+	for (int i = 0; i < outdesc->natts; i++)
+	{
+		Expr	*expr = (Expr *) attrMap->coerceExprs[i];
+
+		if (expr)
+			map->coerceExprs[i] = ExecPrepareExpr(expr, estate);
+	}
+	map->estate = estate;
+	map->in_slot = MakeSingleTupleTableSlot(indesc, &TTSOpsHeapTuple);
+
+	return map;
+}
+
+/*
+ * execute_attr_map_tuple() copied from PG core and adjusted to handle coerce
+ * expressions.
+ */
+HeapTuple
+pg_rewrite_execute_attr_map_tuple(HeapTuple tuple, TupleConversionMapExt *map)
+{
+	AttrMapExt    *attrMap = map->attrMap;
+	Datum	   *invalues = map->invalues;
+	bool	   *inisnull = map->inisnull;
+	Datum	   *outvalues = map->outvalues;
+	bool	   *outisnull = map->outisnull;
+	int			i;
+	ExprContext *ecxt;
+
+	/*
+	 * Extract all the values of the old tuple, offsetting the arrays so that
+	 * invalues[0] is left NULL and invalues[1] is the first source attribute;
+	 * this exactly matches the numbering convention in attrMap.
+	 */
+	heap_deform_tuple(tuple, map->indesc, invalues + 1, inisnull + 1);
+
+	/* Prepare for evaluation of coercion expressions. */
+	ResetPerTupleExprContext(map->estate);
+	ecxt = GetPerTupleExprContext(map->estate);
+	ExecStoreHeapTuple(tuple, map->in_slot, false);
+	ecxt->ecxt_scantuple = map->in_slot;
+
+	/*
+	 * Transpose into proper fields of the new tuple.
+	 */
+	Assert(attrMap->maplen == map->outdesc->natts);
+	for (i = 0; i < attrMap->maplen; i++)
+	{
+		int			j = attrMap->attnums[i];
+		ExprState	*coerceExpr = map->coerceExprs[i];
+
+		if (coerceExpr == NULL)
+		{
+			/* Simply copy the value. */
+			outvalues[i] = invalues[j];
+			outisnull[i] = inisnull[j];
+		}
+		else
+		{
+			/* Perform the coercion. */
+			outvalues[i] = ExecEvalExprSwitchContext(coerceExpr, ecxt,
+													 &outisnull[i]);
+		}
+	}
+
+	/* Cleanup. */
+	ExecClearTuple(map->in_slot);
+
+	/*
+	 * Now form the new tuple.
+	 */
+	return heap_form_tuple(map->outdesc, outvalues, outisnull);
+}
+
+/*
+ * free_conversion_map() copied from PG core and adjusted to handle coerce
+ * expressions.
+ */
+static void
+free_conversion_map_ext(TupleConversionMapExt *map)
+{
+	/* indesc and outdesc are not ours to free */
+	free_attrmap_ext(map->attrMap);
+	pfree(map->invalues);
+	pfree(map->inisnull);
+	pfree(map->outvalues);
+	pfree(map->outisnull);
+	FreeExecutorState(map->estate);
+	ExecDropSingleTupleTableSlot(map->in_slot);
+	pfree(map);
+}
+
 
 #define	TASK_LIST_RES_ATTRS	9
 
