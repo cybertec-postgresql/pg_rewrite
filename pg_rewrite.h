@@ -283,8 +283,6 @@ typedef struct WorkerTask
 	/* The rewrite.wait_after_load GUC, for test purposes. */
 	/* TODO Consider using injection points instead */
 	int		wait_after_load;
-	/* The rewrite.check_constraints GUC, for test purposes. */
-	bool	check_constraints;
 } WorkerTask;
 
 #define		MAX_TASKS	8
