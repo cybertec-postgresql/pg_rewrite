@@ -131,7 +131,6 @@ static IndexCatInfo *get_index_info(Oid relid, int *relninds,
 									bool *found_invalid,
 									bool invalid_check_only,
 									bool *found_pk);
-static TupleDesc get_index_tuple_desc(Oid ind_oid);
 static ModifyTableState *get_modify_table_state(EState *estate, Relation rel,
 												CmdType operation);
 static void free_modify_table_state(ModifyTableState *mtstate);
@@ -2035,18 +2034,6 @@ get_index_info(Oid relid, int *relninds, bool *found_invalid,
 	table_close(rel, AccessShareLock);
 	pfree(oids_a);
 
-	return result;
-}
-
-static TupleDesc
-get_index_tuple_desc(Oid ind_oid)
-{
-	Relation	ind_rel;
-	TupleDesc	result;
-
-	ind_rel = index_open(ind_oid, AccessShareLock);
-	result = CreateTupleDescCopy(RelationGetDescr(ind_rel));
-	index_close(ind_rel, AccessShareLock);
 	return result;
 }
 
