@@ -77,7 +77,7 @@ PG_MODULE_MAGIC;
 static void rewrite_table_impl(char *relschema_src, char *relname_src,
 							   char *relname_new, char *relschema_dst,
 							   char *relname_dst);
-static Relation get_identity_index(Relation rel_dst, TupleDesc tupdesc_src);
+static Relation get_identity_index(Relation rel_dst, Relation rel_src);
 static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* The WAL segment being decoded. */
@@ -821,8 +821,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	LogicalDecodingContext *ctx;
 	ReplicationSlot *slot;
 	Snapshot	snap_hist;
-	TupleDesc	tup_desc_src,
-				ident_src_tupdesc;
+	TupleDesc	tup_desc_src;
 	CatalogState *cat_state;
 	XLogRecPtr	end_of_wal;
 	XLogRecPtr	xlog_insert_ptr;
@@ -1033,12 +1032,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 							RelationGetRelationName(rel_src))));
 	}
 
-	/*
-	 * Store the identity of the source relation, in order to check that of
-	 * the destination table (or its partitions).
-	 */
-	ident_src_tupdesc = get_index_tuple_desc(ident_idx_src);
-
 	/* TODO Move this branch into a function. */
 	if (part_desc)
 	{
@@ -1090,8 +1083,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 					 RelationGetRelationName(partition),
 					 RelationGetRelationName(rel_dst));
 
-			entry->ident_index = get_identity_index(partition,
-													ident_src_tupdesc);
+			entry->ident_index = get_identity_index(partition, rel_src);
 			entry->ind_slot = table_slot_create(partition, NULL);
 			/* Expect many insertions. */
 			entry->bistate = GetBulkInsertState();
@@ -1110,12 +1102,11 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	}
 	else
 	{
-		ident_index = get_identity_index(rel_dst, ident_src_tupdesc);
+		ident_index = get_identity_index(rel_dst, rel_src);
 		ident_key = build_identity_key(ident_index, &ident_key_nentries);
 		ind_slot = table_slot_create(rel_dst, NULL);
 	}
 	Assert(ident_key_nentries > 0);
-	FreeTupleDesc(ident_src_tupdesc);
 
 	/*
 	 * We need to know whether no DDL took place that allows for data
@@ -1391,15 +1382,15 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 }
 
 /*
- * Check if identity index of 'rel_dest' has tuple descriptor that matches
- * 'tupdesc_src' and return the index.
+ * Check that both relations have matching identity indexes and return the
+ * identity index of 'rel_dst'.
  */
 static Relation
-get_identity_index(Relation rel_dst, TupleDesc tupdesc_src)
+get_identity_index(Relation rel_dst, Relation rel_src)
 {
-	Oid			index_dst_oid;
-	Relation	index_dst;
-	TupleDesc	tupdesc_dst;
+	Oid			index_dst_oid, index_src_oid;
+	Relation	index_dst, index_src;
+	TupleDesc	tupdesc_dst, tupdesc_src;
 	bool		match = true;
 
 	index_dst_oid = RelationGetReplicaIndex(rel_dst);
@@ -1408,6 +1399,14 @@ get_identity_index(Relation rel_dst, TupleDesc tupdesc_src)
 			 RelationGetRelationName(rel_dst));
 	index_dst = index_open(index_dst_oid, AccessShareLock);
 	tupdesc_dst = RelationGetDescr(index_dst);
+
+	index_src_oid = RelationGetReplicaIndex(rel_src);
+	if (!OidIsValid(index_src_oid))
+		elog(ERROR, "Identity index missing on table \"%s\"",
+			 RelationGetRelationName(rel_src));
+	index_src = index_open(index_src_oid, AccessShareLock);
+	tupdesc_src = RelationGetDescr(index_src);
+
 
 	/*
 	 * The tuple descriptors might not be equal, since some attributes of
@@ -1437,8 +1436,10 @@ get_identity_index(Relation rel_dst, TupleDesc tupdesc_src)
 
 	if (!match)
 		elog(ERROR,
-			 "identity index on table \"%s\" does not match that on the source table",
-			 RelationGetRelationName(rel_dst));
+			 "identity index on table \"%s\" does not match that on table \"%s\"",
+			 RelationGetRelationName(rel_dst), RelationGetRelationName(rel_src));
+
+	index_close(index_src, AccessShareLock);
 
 	return index_dst;
 }
