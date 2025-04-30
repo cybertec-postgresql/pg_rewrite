@@ -403,6 +403,7 @@ get_task(int *idx, char *relschema, char *relname)
 	namestrcpy(&task->relname, relname);
 
 	task->msg[0] = '\0';
+	task->msg_detail[0] = '\0';
 
 	*idx = i;
 	return task;
@@ -440,6 +441,7 @@ run_worker(BackgroundWorker *worker, WorkerTask *task)
 	BgwHandleStatus status;
 	pid_t		pid;
 	char	*msg = NULL;
+	char	*msg_detail = NULL;
 
 	/*
 	 * Start the worker. Avoid leaking the task if the function ends due to
@@ -521,12 +523,20 @@ run_worker(BackgroundWorker *worker, WorkerTask *task)
 done:
 	if (strlen(task->msg) > 0)
 		msg = pstrdup(task->msg);
+	if (strlen(task->msg_detail) > 0)
+		msg_detail = pstrdup(task->msg_detail);
 
 	release_task(task);
 
 	/* Report the worker's ERROR in the backend. */
 	if (msg)
-		ereport(ERROR, (errmsg("%s", msg)));
+	{
+		if (msg_detail)
+			ereport(ERROR, (errmsg("%s", msg),
+							errdetail("%s", msg_detail)));
+		else
+			ereport(ERROR, (errmsg("%s", msg)));
+	}
 
 }
 
@@ -714,12 +724,14 @@ rewrite_worker_main(Datum main_arg)
 		AbortOutOfAnyTransaction();
 
 		/*
-		 * Currently we only copy the error message, more fields, more
-		 * information can be added if needed. (Ideally we'd use the message
-		 * queue like parallel workers do, but the related PG core functions
-		 * have some parallel worker specific arguments.)
+		 * Currently we only copy 'message' and 'detail.More information can
+		 * be added if needed. (Ideally we'd use the message queue like
+		 * parallel workers do, but the related PG core functions have some
+		 * parallel worker specific arguments.)
 		 */
 		strlcpy(task->msg, edata->message, MAX_ERR_MSG_LEN);
+		if (edata->detail && strlen(edata->detail) > 0)
+			strlcpy(task->msg_detail, edata->detail, MAX_ERR_MSG_LEN);
 
 		FreeErrorData(edata);
 	}

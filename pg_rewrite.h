@@ -240,6 +240,9 @@ typedef struct WorkerTask
 #define	MAX_ERR_MSG_LEN	1024
 	char		msg[MAX_ERR_MSG_LEN];
 
+	/* Detailed error message. */
+	char		msg_detail[MAX_ERR_MSG_LEN];
+
 	/* The rewrite.wait_after_load GUC, for test purposes. */
 	/* TODO Consider using injection points instead */
 	int		wait_after_load;
