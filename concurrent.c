@@ -278,12 +278,27 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 			ExecStoreHeapTuple(tup, slot, false);
 			if (proute)
 			{
+				PartitionEntry	*entry;
+
 				rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
 										proute, slot, estate);
 				rel_ins = rri->ri_RelationDesc;
 
-				bistate = get_partition_insert_state(partitions,
-													 RelationGetRelid(rel_ins));
+				entry = get_partition_entry(partitions,
+											RelationGetRelid(rel_ins));
+				bistate = entry->bistate;
+
+				/*
+				 * Make sure the tuple matches the partition. The typical
+				 * problem we address here is that a partition was attached
+				 * that has a different order of columns.
+				 */
+				if (entry->conv_map)
+				{
+					tup = convert_tuple_for_dest_table(tup, entry->conv_map);
+					ExecClearTuple(slot);
+					ExecStoreHeapTuple(tup, slot, false);
+				}
 			}
 			else
 			{
@@ -361,8 +376,12 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 			{
 				ItemPointerData ctid;
 				List	   *recheck;
+				PartitionEntry *entry;
 
-				/* Delete the old tuple from its partition. */
+				/*
+				 * Cross-partition update. Delete the old tuple from its
+				 * partition.
+				 */
 				find_tuple_in_partition(tup_old, rri_old->ri_RelationDesc,
 										partitions, key, nkeys, &ctid);
 				simple_heap_delete(rri_old->ri_RelationDesc, &ctid);
@@ -372,7 +391,14 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 				MyWorkerTask->progress.del++;
 				SpinLockRelease(&MyWorkerTask->mutex);
 
-				/* Insert the new tuple into its partition. */
+				/*
+				 * Insert the new tuple into its partition. This might include
+				 * conversion to match the partition, see above.
+				 */
+				entry = get_partition_entry(partitions,
+											RelationGetRelid(rri->ri_RelationDesc));
+				if (entry->conv_map)
+					tup = convert_tuple_for_dest_table(tup, entry->conv_map);
 				ExecStoreHeapTuple(tup, slot, false);
 				table_tuple_insert(rri->ri_RelationDesc, slot,
 								   GetCurrentCommandId(true), 0, NULL);
@@ -437,6 +463,20 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 #if PG_VERSION_NUM >= 160000
 					TU_UpdateIndexes	update_indexes;
 #endif
+
+					if (partitions)
+					{
+						PartitionEntry *entry;
+
+						/*
+						 * Make sure the tuple matches the partition.
+						 */
+						entry = get_partition_entry(partitions,
+													RelationGetRelid(rri->ri_RelationDesc));
+						if (entry->conv_map)
+							tup = convert_tuple_for_dest_table(tup,
+															   entry->conv_map);
+					}
 
 					simple_heap_update(rri->ri_RelationDesc, &ctid, tup
 #if PG_VERSION_NUM >= 160000

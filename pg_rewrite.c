@@ -1017,6 +1017,9 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 
 			entry->ident_index = get_identity_index(partition, rel_src);
 			entry->ind_slot = table_slot_create(partition, NULL);
+			entry->conv_map =
+				convert_tuples_by_name_ext(RelationGetDescr(rel_dst),
+										   RelationGetDescr(partition));
 			/* Expect many insertions. */
 			entry->bistate = GetBulkInsertState();
 
@@ -1284,11 +1287,11 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 
 	if (part_desc)
 	{
+		close_partitions(partitions);
+
 		for (i = 0; i < part_desc->nparts; i++)
 			table_close(parts_dst[i], AccessExclusiveLock);
-
 		pfree(parts_dst);
-		close_partitions(partitions);
 	}
 	else
 	{
@@ -2685,20 +2688,39 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 			if (tup_out == NULL)
 				break;
 
-			/* Convert the tuple if needed. */
+			/*
+			 * If needed, convert the tuple so it matches the destination
+			 * table.
+			 */
 			if (conv_map)
 				tup_out = convert_tuple_for_dest_table(tup_out, conv_map);
 			ExecStoreHeapTuple(tup_out, slot_dst, false);
 
 			if (proute)
 			{
+				PartitionEntry *entry;
+
 				/* Find out which partition the tuple belongs to. */
 				rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
 										proute, slot_dst, estate);
 
 				rel_ins = rri->ri_RelationDesc;
-				bistate = get_partition_insert_state(partitions,
-													 RelationGetRelid(rri->ri_RelationDesc));
+				entry = get_partition_entry(partitions,
+											RelationGetRelid(rri->ri_RelationDesc));
+				bistate = entry->bistate;
+
+				/*
+				 * Make sure the tuple matches the partition. The typical
+				 * problem we address here is that a partition was attached
+				 * that has a different order of columns.
+				 */
+				if (entry->conv_map)
+				{
+					tup_out = convert_tuple_for_dest_table(tup_out,
+														   entry->conv_map);
+					ExecClearTuple(slot_dst);
+					ExecStoreHeapTuple(tup_out, slot_dst, false);
+				}
 			}
 			else
 			{
@@ -3061,6 +3083,8 @@ close_partitions(partitions_hash *partitions)
 	{
 		index_close(entry->ident_index, AccessShareLock);
 		ExecDropSingleTupleTableSlot(entry->ind_slot);
+		if (entry->conv_map)
+			free_conversion_map_ext(entry->conv_map);
 		FreeBulkInsertState(entry->bistate);
 	}
 
@@ -3068,10 +3092,10 @@ close_partitions(partitions_hash *partitions)
 }
 
 /*
- * Find BulkInsertState for given partition.
+ * Find hash entry for given partition.
  */
-BulkInsertState
-get_partition_insert_state(partitions_hash *partitions, Oid part_oid)
+PartitionEntry *
+get_partition_entry(partitions_hash *partitions, Oid part_oid)
 {
 	PartitionEntry *entry;
 
@@ -3080,7 +3104,7 @@ get_partition_insert_state(partitions_hash *partitions, Oid part_oid)
 		elog(ERROR, "bulk insert state not found for partition %u", part_oid);
 	Assert(entry->part_oid == part_oid);
 
-	return entry->bistate;
+	return entry;
 }
 
 /*

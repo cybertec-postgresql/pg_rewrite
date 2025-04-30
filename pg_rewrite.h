@@ -185,39 +185,6 @@ typedef struct CatalogState
 	bool		have_pk_index;
 } CatalogState;
 
-/*
- * Hash table to cache partition-specific information.
- */
-typedef struct PartitionEntry
-{
-	Oid			part_oid;		/* key */
-	Relation	ident_index;
-
-	/*
-	 * Slot to retrieve tuples from identity index. Since we only allow
-	 * partitions to have exactly the same attributes as the parent table, it
-	 * should work if we used the same slot for all partitions. However it
-	 * seems cleaner if separate slots are used.
-	 */
-	TupleTableSlot *ind_slot;
-
-	/* This should make insertions into partitions more efficient. */
-	BulkInsertState bistate;
-
-	char		status;			/* used by simplehash */
-} PartitionEntry;
-
-#define SH_PREFIX partitions
-#define SH_ELEMENT_TYPE PartitionEntry
-#define SH_KEY_TYPE Oid
-#define SH_KEY part_oid
-#define SH_HASH_KEY(tb, key) (key)
-#define SH_EQUAL(tb, a, b) ((a) == (b))
-#define SH_SCOPE static inline
-#define SH_DECLARE
-#define SH_DEFINE
-#include "lib/simplehash.h"
-
 /* Progress tracking. */
 typedef struct TaskProgress
 {
@@ -233,6 +200,7 @@ typedef struct TaskProgress
 	int64		del;
 } TaskProgress;
 
+/* TODO Remove */
 typedef enum WorkerTaskKind
 {
 	WORKER_TASK_PARTITION
@@ -325,6 +293,40 @@ typedef struct TupleConversionMapExt
 								 * coercion. */
 } TupleConversionMapExt;
 
+/*
+ * Hash table to cache partition-specific information.
+ */
+typedef struct PartitionEntry
+{
+	Oid			part_oid;		/* key */
+	Relation	ident_index;
+
+	/* Slot to retrieve tuples from identity index. */
+	TupleTableSlot *ind_slot;
+
+	/* This should make insertions into partitions more efficient. */
+	BulkInsertState bistate;
+
+	/*
+	 * Map to convert tuples that match the partitioned table so they match
+	 * this partition.
+	 */
+	TupleConversionMapExt	*conv_map;
+
+	char		status;			/* used by simplehash */
+} PartitionEntry;
+
+#define SH_PREFIX partitions
+#define SH_ELEMENT_TYPE PartitionEntry
+#define SH_KEY_TYPE Oid
+#define SH_KEY part_oid
+#define SH_HASH_KEY(tb, key) (key)
+#define SH_EQUAL(tb, a, b) ((a) == (b))
+#define SH_SCOPE static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
 extern PGDLLEXPORT void rewrite_worker_main(Datum main_arg);
 
 extern void pg_rewrite_exit_if_requested(void);
@@ -357,7 +359,7 @@ extern bool pg_rewrite_decode_concurrent_changes(LogicalDecodingContext *ctx,
 extern HeapTuple convert_tuple_for_dest_table(HeapTuple tuple,
 											  TupleConversionMapExt *conv_map);
 extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);
-extern BulkInsertState get_partition_insert_state(partitions_hash *partitions,
-												  Oid part_oid);;
+extern PartitionEntry *get_partition_entry(partitions_hash *partitions,
+										   Oid part_oid);;
 extern HeapTuple pg_rewrite_execute_attr_map_tuple(HeapTuple tuple,
 												   TupleConversionMapExt *map);
