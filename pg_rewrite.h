@@ -200,12 +200,6 @@ typedef struct TaskProgress
 	int64		del;
 } TaskProgress;
 
-/* TODO Remove */
-typedef enum WorkerTaskKind
-{
-	WORKER_TASK_PARTITION
-} WorkerTaskKind;
-
 /*
  * The new implementation, which delegates the execution to a background
  * worker (as opposed to the PG executor).
@@ -215,8 +209,6 @@ typedef enum WorkerTaskKind
  */
 typedef struct WorkerTask
 {
-	WorkerTaskKind	kind;
-
 	/* Connection info. */
 	Oid		dbid;
 	Oid		roleid;

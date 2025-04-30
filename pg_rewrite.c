@@ -574,7 +574,6 @@ rewrite_table(PG_FUNCTION_ARGS)
 
 	task = get_task(&task_idx, rv_src->schemaname, rv_src->relname);
 	Assert(task_idx < MAX_TASKS);
-	task->kind = WORKER_TASK_PARTITION;
 
 	/* Fill-in the partitioning specific fields. */
 	if (rv_dst->schemaname)
@@ -673,7 +672,6 @@ rewrite_worker_main(Datum main_arg)
 	StartTransactionCommand();
 	PG_TRY();
 	{
-		Assert(MyWorkerTask->kind == WORKER_TASK_PARTITION);
 		rewrite_table_impl(relschema, relname, relname_new, relschema_dst,
 						   relname_dst);
 		CommitTransactionCommand();
