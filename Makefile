@@ -8,8 +8,7 @@ DATA = pg_rewrite--1.0.sql pg_rewrite--1.0--1.1.sql pg_rewrite--1.1--1.2.sql \
 pg_rewrite--1.2--1.3.sql
 DOCS = pg_rewrite.md
 
-REGRESS = main
-REGRESS_OPTS = "--schedule=parallel_schedule"
+REGRESS = pg_rewrite
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
