@@ -9,6 +9,7 @@ pg_rewrite--1.2--1.3.sql
 DOCS = pg_rewrite.md
 
 REGRESS = pg_rewrite
+ISOLATION = pg_rewrite_concurrent
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

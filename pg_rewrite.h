@@ -243,9 +243,13 @@ typedef struct WorkerTask
 	/* Detailed error message. */
 	char		msg_detail[MAX_ERR_MSG_LEN];
 
-	/* The rewrite.wait_after_load GUC, for test purposes. */
-	/* TODO Consider using injection points instead */
-	int		wait_after_load;
+	/*
+	 * Should rewrite_table() return w/o waiting for the worker's exit? If
+	 * this flag is set, the worker is responsible for releasing the
+	 * task. Otherwise the worker must not release the task because the
+	 * backend might be interested in 'msg' and 'msg_detail'.
+	 */
+	bool	nowait;
 } WorkerTask;
 
 #define		MAX_TASKS	8

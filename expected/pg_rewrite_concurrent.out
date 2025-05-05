@@ -1,0 +1,95 @@
+Parsed test spec with 2 sessions
+
+starting permutation: wait_before_lock wait_for_s1_sleep do_changes wakeup_before_lock wait_for_backend_exit check
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step wait_before_lock: 
+    SELECT rewrite_table_nowait('tbl_src', 'tbl_dst', 'tbl_src_old');
+
+rewrite_table_nowait
+--------------------
+                    
+(1 row)
+
+step wait_for_s1_sleep: 
+DO $$
+BEGIN
+        LOOP
+		PERFORM pg_stat_clear_snapshot();
+
+	        PERFORM
+		FROM pg_stat_activity
+		WHERE (wait_event_type, wait_event)=('InjectionPoint', 'pg_rewrite-before-lock');
+
+		IF FOUND THEN
+			EXIT;
+		END IF;
+
+		PERFORM pg_sleep(.1);
+	END LOOP;
+END;
+$$
+
+step do_changes: 
+	-- Insert one row into each partition.
+	INSERT INTO tbl_src VALUES (2, 2), (3, 3), (5, 5);
+
+	-- Update with no identity change.
+	UPDATE tbl_src SET j=0 WHERE i=1;
+
+	-- Update with identity change but within the same partition.
+	UPDATE tbl_src SET i=6 WHERE i=5;
+
+	-- Cross-partition update.
+	UPDATE tbl_src SET i=7 WHERE i=3;
+
+	-- Update a row we inserted and updated, to check that it's visible.
+	UPDATE tbl_src SET j=4 WHERE i=7;
+
+	-- Delete.
+	DELETE FROM tbl_src WHERE i=4;
+
+step wakeup_before_lock: 
+    SELECT injection_points_wakeup('pg_rewrite-before-lock');
+    SELECT injection_points_detach('pg_rewrite-before-lock');
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step wait_for_backend_exit: 
+DO $$
+BEGIN
+        LOOP
+		PERFORM FROM pg_rewrite_progress;
+
+		IF NOT FOUND THEN
+			EXIT;
+		END IF;
+
+		PERFORM pg_sleep(.1);
+	END LOOP;
+END;
+$$;
+
+
+step check: 
+    SELECT i, j FROM tbl_src ORDER BY i, j;
+
+i|j
+-+-
+1|0
+2|2
+6|5
+7|4
+(4 rows)
+

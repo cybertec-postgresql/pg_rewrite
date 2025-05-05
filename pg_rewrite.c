@@ -63,6 +63,7 @@
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -112,9 +113,14 @@ static void worker_shmem_request(void);
 static void worker_shmem_startup(void);
 static void worker_shmem_shutdown(int code, Datum arg);
 
-static WorkerTask *get_task(int *idx, char *relschema, char *relname);
+static void relation_rewrite_get_args(PG_FUNCTION_ARGS, RangeVar **rv_src_p,
+									  RangeVar **rv_src_new_p,
+									  RangeVar **rv_dst_p);
+static WorkerTask *get_task(int *idx, char *relschema, char *relname,
+							bool nowait);
 static void initialize_worker(BackgroundWorker *worker, int task_idx);
-static void run_worker(BackgroundWorker *worker, WorkerTask *task);
+static void run_worker(BackgroundWorker *worker, WorkerTask *task,
+					   bool nowait);
 
 static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
@@ -184,14 +190,6 @@ static void free_conversion_map_ext(TupleConversionMapExt *map);
  */
 int			rewrite_max_xlock_time = 0;
 
-/*
- * Time (in seconds) to wait after the initial load has completed and before
- * we start decoding of data changes introduced by other transactions. This
- * helps to ensure defined order of steps when we test processing of the
- * concurrent changes.
- */
-int			rewrite_wait_after_load = 0;
-
 #if PG_VERSION_NUM >= 150000
 shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
@@ -223,17 +221,6 @@ _PG_init(void)
 							0, 0, INT_MAX,
 							PGC_USERSET,
 							GUC_UNIT_MS,
-							NULL, NULL, NULL);
-
-	DefineCustomIntVariable("rewrite.wait_after_load",
-							"Time to wait after the initial load.",
-							"Time to wait after the initial load, so that a concurrent session "
-							"can perform data changes before processing goes on. This is useful "
-							"for regression tests.",
-							&rewrite_wait_after_load,
-							0, 0, 10,
-							PGC_USERSET,
-							GUC_UNIT_S,
 							NULL, NULL, NULL);
 }
 
@@ -276,7 +263,7 @@ partition_table_new(PG_FUNCTION_ARGS)
 /* Pointer to task array in the shared memory, available in all backends. */
 static WorkerTask	*workerTasks = NULL;
 
-/* Each backend stores here the pointer to its task in the shared memory. */
+/* Each worker stores here the pointer to its task in the shared memory. */
 WorkerTask *MyWorkerTask = NULL;
 
 static void
@@ -288,10 +275,43 @@ interrupt_worker(WorkerTask *task)
 }
 
 static void
-release_task(WorkerTask *task)
+release_task(WorkerTask *task, bool worker)
 {
+	if (worker)
+	{
+		SpinLockAcquire(&task->mutex);
+
+		/*
+		 * First, handle special case that can happen in regression tests. If
+		 * rewrite_table_nowait() gets cancelled before the worker got its
+		 * MyDatabaseId assigned, 'task' slot can leak (note that
+		 * rewrite_table_nowait() does not release the task in this case). We
+		 * can release the task regardless of MyDatabaseId because
+		 * pg_rewrite_concurrent.spec should not launch a new worker (and thus
+		 * reuse the task) before the existing one exited.
+		 */
+		if (task->nowait)
+			task->dbid = InvalidOid;
+		/*
+		 * Otherwise, worker must not release the task because the backend can
+		 * be interested in its contents.
+		 */
+
+		/*
+		 * However, the worker always should clear the fields it set.
+		 */
+		task->pid = InvalidPid;
+		task->exit_requested = false;
+		SpinLockRelease(&task->mutex);
+		return;
+	}
+
+	/*
+	 * The following should only be performed by the backend, after the worker
+	 * has exited.
+	 */
 	SpinLockAcquire(&task->mutex);
-	Assert(task->dbid != InvalidOid);
+	Assert(OidIsValid(task->dbid));
 	task->dbid = InvalidOid;
 	SpinLockRelease(&task->mutex);
 }
@@ -350,19 +370,48 @@ static void
 worker_shmem_shutdown(int code, Datum arg)
 {
 	if (MyWorkerTask)
-	{
-		SpinLockAcquire(&MyWorkerTask->mutex);
-		MyWorkerTask->pid = InvalidPid;
-		MyWorkerTask->exit_requested = false;
-		SpinLockRelease(&MyWorkerTask->mutex);
-	}
+		release_task(MyWorkerTask, true);
+}
+
+static void
+relation_rewrite_get_args(PG_FUNCTION_ARGS, RangeVar **rv_src_p,
+						  RangeVar **rv_src_new_p, RangeVar **rv_dst_p)
+{
+	text	*rel_src_t, *rel_src_new_t, *rel_dst_t;
+	RangeVar	*rv_src, *rv_src_new, *rv_dst;
+
+	rel_src_t = PG_GETARG_TEXT_PP(0);
+	rv_src = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_t));
+
+	rel_dst_t = PG_GETARG_TEXT_PP(1);
+	rv_dst = makeRangeVarFromNameList(textToQualifiedNameList(rel_dst_t));
+
+	rel_src_new_t = PG_GETARG_TEXT_PP(2);
+	rv_src_new = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_new_t));
+
+	if (rv_src->catalogname || rv_dst->catalogname || rv_src_new->catalogname)
+		ereport(ERROR,
+				(errmsg("relation may only be qualified by schema, not by database")));
+
+	/*
+	 * Technically it's possible to move the source relation to another schema
+	 * but don't bother for this version.
+	 */
+	if (rv_src_new->schemaname)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_NAME),
+				 (errmsg("the new source relation name may not be qualified"))));
+
+	*rv_src_p = rv_src;
+	*rv_src_new_p = rv_src_new;
+	*rv_dst_p = rv_dst;
 }
 
 /*
  * Find a free task structure and initialize the common fields.
  */
 static WorkerTask *
-get_task(int *idx, char *relschema, char *relname)
+get_task(int *idx, char *relschema, char *relname, bool nowait)
 {
 	int		i;
 	WorkerTask	*task = NULL;
@@ -405,6 +454,8 @@ get_task(int *idx, char *relschema, char *relname)
 	task->msg[0] = '\0';
 	task->msg_detail[0] = '\0';
 
+	task->nowait = nowait;
+
 	*idx = i;
 	return task;
 }
@@ -435,7 +486,7 @@ initialize_worker(BackgroundWorker *worker, int task_idx)
 }
 
 static void
-run_worker(BackgroundWorker *worker, WorkerTask *task)
+run_worker(BackgroundWorker *worker, WorkerTask *task, bool nowait)
 {
 	BackgroundWorkerHandle *handle;
 	BgwHandleStatus status;
@@ -466,7 +517,7 @@ run_worker(BackgroundWorker *worker, WorkerTask *task)
 		 */
 		interrupt_worker(task);
 
-		release_task(task);
+		release_task(task, false);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -490,6 +541,10 @@ run_worker(BackgroundWorker *worker, WorkerTask *task)
 	 */
 	Assert(status == BGWH_STARTED);
 
+	if (nowait)
+		/* The worker should take care of releasing the task. */
+		return;
+
 	PG_TRY();
 	{
 		status = WaitForBackgroundWorkerShutdown(handle);
@@ -502,7 +557,7 @@ run_worker(BackgroundWorker *worker, WorkerTask *task)
 		 */
 		interrupt_worker(task);
 
-		release_task(task);
+		release_task(task, false);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -526,7 +581,7 @@ done:
 	if (strlen(task->msg_detail) > 0)
 		msg_detail = pstrdup(task->msg_detail);
 
-	release_task(task);
+	release_task(task, false);
 
 	/* Report the worker's ERROR in the backend. */
 	if (msg)
@@ -554,38 +609,17 @@ PG_FUNCTION_INFO_V1(rewrite_table);
 Datum
 rewrite_table(PG_FUNCTION_ARGS)
 {
-	text	*rel_src_t, *rel_src_new_t, *rel_dst_t;
 	RangeVar	*rv_src, *rv_src_new, *rv_dst;
 	BackgroundWorker worker;
 	WorkerTask	*task;
 	int		task_idx;
 
-	rel_src_t = PG_GETARG_TEXT_PP(0);
-	rv_src = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_t));
+	relation_rewrite_get_args(fcinfo, &rv_src, &rv_src_new, &rv_dst);
 
-	rel_dst_t = PG_GETARG_TEXT_PP(1);
-	rv_dst = makeRangeVarFromNameList(textToQualifiedNameList(rel_dst_t));
-
-	rel_src_new_t = PG_GETARG_TEXT_PP(2);
-	rv_src_new = makeRangeVarFromNameList(textToQualifiedNameList(rel_src_new_t));
-
-	if (rv_src->catalogname || rv_dst->catalogname || rv_src_new->catalogname)
-		ereport(ERROR,
-				(errmsg("relation may only be qualified by schema, not by database")));
-
-	/*
-	 * Technically it's possible to move the source relation to another schema
-	 * but don't bother for this version.
-	 */
-	if (rv_src_new->schemaname)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_NAME),
-				 (errmsg("the new source relation name may not be qualified"))));
-
-	task = get_task(&task_idx, rv_src->schemaname, rv_src->relname);
+	task = get_task(&task_idx, rv_src->schemaname, rv_src->relname, false);
 	Assert(task_idx < MAX_TASKS);
 
-	/* Fill-in the partitioning specific fields. */
+	/* Specify the relation to be processed. */
 	if (rv_dst->schemaname)
 		namestrcpy(&task->relschema_dst, rv_dst->schemaname);
 	else
@@ -595,13 +629,40 @@ rewrite_table(PG_FUNCTION_ARGS)
 
 	initialize_worker(&worker, task_idx);
 
-	/*
-	 * The worker does not reload the configuration, so we pass these GUC
-	 * setting via the shared memory.
-	 */
-	task->wait_after_load = rewrite_wait_after_load;
+	run_worker(&worker, task, false);
 
-	run_worker(&worker, task);
+	PG_RETURN_VOID();
+}
+
+/*
+ * See pg_rewrite_concurrent.spec for information why this function is needed.
+ */
+extern Datum rewrite_table_nowait(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(rewrite_table_nowait);
+Datum
+rewrite_table_nowait(PG_FUNCTION_ARGS)
+{
+	RangeVar	*rv_src, *rv_src_new, *rv_dst;
+	BackgroundWorker worker;
+	WorkerTask	*task;
+	int		task_idx;
+
+	relation_rewrite_get_args(fcinfo, &rv_src, &rv_src_new, &rv_dst);
+
+	task = get_task(&task_idx, rv_src->schemaname, rv_src->relname, true);
+	Assert(task_idx < MAX_TASKS);
+
+	/* Specify the relation to be processed. */
+	if (rv_dst->schemaname)
+		namestrcpy(&task->relschema_dst, rv_dst->schemaname);
+	else
+		NameStr(task->relschema_dst)[0] = '\0';
+	namestrcpy(&task->relname_dst, rv_dst->relname);
+	namestrcpy(&task->relname_new, rv_src_new->relname);
+
+	initialize_worker(&worker, task_idx);
+
+	run_worker(&worker, task, true);
 
 	PG_RETURN_VOID();
 }
@@ -648,13 +709,10 @@ rewrite_worker_main(Datum main_arg)
 	relschema_dst = *relschema_dst != '\0' ? pstrdup(relschema_dst) : NULL;
 	relname_dst = pstrdup(NameStr(task->relname_dst));
 
-	rewrite_wait_after_load = task->wait_after_load;
-
 	/*
 	 * Get the information provided by the backend and set our pid.
 	 */
 	SpinLockAcquire(&MyWorkerTask->mutex);
-	Assert(MyWorkerTask->dbid != InvalidOid);
 	dbid = MyWorkerTask->dbid;
 	Assert(MyWorkerTask->roleid != InvalidOid);
 	roleid = MyWorkerTask->roleid;
@@ -1133,6 +1191,12 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	table_close(rel_src, AccessShareLock);
 
+    /*
+     * During testing, wait for another backend to perform concurrent data
+     * changes which we will process below.
+     */
+    INJECTION_POINT("pg_rewrite-before-lock");
+
 	/*
 	 * Flush all WAL records inserted so far (possibly except for the last
 	 * incomplete page, see GetInsertRecPtr), to minimize the amount of data
@@ -1140,33 +1204,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	xlog_insert_ptr = GetInsertRecPtr();
 	XLogFlush(xlog_insert_ptr);
-
-	/*
-	 * During regression tests, wait until the other transactions performed
-	 * their data changes so that we can process them.
-	 *
-	 * Since this should only be used for tests, don't bother using
-	 * WaitLatch().
-	 */
-	if (rewrite_wait_after_load > 0)
-	{
-		LOCKTAG		tag;
-		Oid			extension_id;
-		LockAcquireResult lock_res PG_USED_FOR_ASSERTS_ONLY;
-
-		extension_id = get_extension_oid("pg_rewrite", false);
-		SET_LOCKTAG_OBJECT(tag, MyDatabaseId, ExtensionRelationId,
-						   extension_id, 0);
-		lock_res = LockAcquire(&tag, ExclusiveLock, false, false);
-		Assert(lock_res == LOCKACQUIRE_OK);
-
-		/*
-		 * Misuse lock on our extension to let the concurrent backend(s) check
-		 * that we're exactly here.
-		 */
-		pg_usleep(rewrite_wait_after_load * 1000000L);
-		LockRelease(&tag, ExclusiveLock, false);
-	}
 
 	/*
 	 * Since we'll do some more changes, all the WAL records flushed so far
