@@ -43,4 +43,4 @@ jobs:
     - name: show regression diffs
       if: ${{ failure() }}
       run: |
-        cat regression.diffs
+        cat /home/runner/work/pg_rewrite/pg_rewrite/output_iso/regression.diffs
