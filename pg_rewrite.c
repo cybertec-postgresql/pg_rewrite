@@ -743,6 +743,13 @@ rewrite_worker_main(Datum main_arg)
 		rewrite_table_impl(relschema, relname, relname_new, relschema_dst,
 						   relname_dst);
 		CommitTransactionCommand();
+
+		/*
+		 * In regression tests, use this injection point to check that
+		 * the changes are visible by other transactions.
+		 */
+		INJECTION_POINT("pg_rewrite-after-commit");
+
 	}
 	PG_CATCH();
 	{

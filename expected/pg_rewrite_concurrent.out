@@ -1,12 +1,12 @@
 Parsed test spec with 2 sessions
 
-starting permutation: wait_before_lock wait_for_s1_sleep do_changes wakeup_before_lock wait_for_backend_exit check
+starting permutation: do_rewrite wait_for_before_lock_ip do_changes wakeup_before_lock_ip wait_for_after_commit_ip check wakeup_after_commit_ip
 injection_points_attach
 -----------------------
                        
 (1 row)
 
-step wait_before_lock: 
+step do_rewrite: 
     SELECT rewrite_table_nowait('tbl_src', 'tbl_dst', 'tbl_src_old');
 
 rewrite_table_nowait
@@ -14,7 +14,7 @@ rewrite_table_nowait
                     
 (1 row)
 
-step wait_for_s1_sleep: 
+step wait_for_before_lock_ip: 
 DO $$
 BEGIN
         LOOP
@@ -52,9 +52,53 @@ step do_changes:
 	-- Delete.
 	DELETE FROM tbl_src WHERE i=4;
 
-step wakeup_before_lock: 
+step wakeup_before_lock_ip: 
     SELECT injection_points_wakeup('pg_rewrite-before-lock');
-    SELECT injection_points_detach('pg_rewrite-before-lock');
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step wait_for_after_commit_ip: 
+DO $$
+BEGIN
+        LOOP
+		PERFORM pg_stat_clear_snapshot();
+
+	        PERFORM
+		FROM pg_stat_activity
+		WHERE (wait_event_type, wait_event)=('InjectionPoint', 'pg_rewrite-after-commit');
+
+		IF FOUND THEN
+			EXIT;
+		END IF;
+
+		PERFORM pg_sleep(.1);
+	END LOOP;
+END;
+$$
+
+step check: 
+    TABLE pg_rewrite_progress;
+
+    SELECT i, j FROM tbl_src ORDER BY i, j;
+
+src_table|dst_table|src_table_new|ins_initial|ins|upd|del
+---------+---------+-------------+-----------+---+---+---
+tbl_src  |tbl_dst  |tbl_src_old  |          2|  4|  3|  2
+(1 row)
+
+i|j
+-+-
+1|0
+2|2
+6|5
+7|4
+(4 rows)
+
+step wakeup_after_commit_ip: 
+    SELECT injection_points_wakeup('pg_rewrite-after-commit');
 
 injection_points_wakeup
 -----------------------
@@ -65,31 +109,4 @@ injection_points_detach
 -----------------------
                        
 (1 row)
-
-step wait_for_backend_exit: 
-DO $$
-BEGIN
-        LOOP
-		PERFORM FROM pg_rewrite_progress;
-
-		IF NOT FOUND THEN
-			EXIT;
-		END IF;
-
-		PERFORM pg_sleep(.1);
-	END LOOP;
-END;
-$$;
-
-
-step check: 
-    SELECT i, j FROM tbl_src ORDER BY i, j;
-
-i|j
--+-
-1|0
-2|2
-6|5
-7|4
-(4 rows)
 
