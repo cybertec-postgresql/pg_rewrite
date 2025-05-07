@@ -31,11 +31,11 @@ BEGIN
 		PERFORM pg_sleep(.1);
 	END LOOP;
 END;
-$$
+$$;
 
 step do_changes: 
 	-- Insert one row into each partition.
-	INSERT INTO tbl_src VALUES (2, 2), (3, 3), (5, 5);
+	INSERT INTO tbl_src VALUES (2, 20), (3, 30), (5, 50);
 
 	-- Update with no identity change.
 	UPDATE tbl_src SET j=0 WHERE i=1;
@@ -89,12 +89,12 @@ src_table|dst_table|src_table_new|ins_initial|ins|upd|del
 tbl_src  |tbl_dst  |tbl_src_old  |          2|  4|  3|  2
 (1 row)
 
-i|j
--+-
-1|0
-2|2
-6|5
-7|4
+i| j
+-+--
+1| 0
+2|20
+6|50
+7| 4
 (4 rows)
 
 step wakeup_after_commit_ip: 
