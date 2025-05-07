@@ -1371,7 +1371,6 @@ get_identity_index(Relation rel_dst, Relation rel_src)
 	index_src = index_open(index_src_oid, AccessShareLock);
 	tupdesc_src = RelationGetDescr(index_src);
 
-
 	/*
 	 * The tuple descriptors might not be equal, since some attributes of
 	 * rel_dst can have different types. What should match though is attribute

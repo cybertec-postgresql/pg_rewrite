@@ -4,11 +4,15 @@ setup
     CREATE EXTENSION pg_rewrite;
 
     CREATE TABLE tbl_src(i int primary key, j int);
-    INSERT INTO tbl_src(i, j) VALUES (1, 1), (4, 4);
+    INSERT INTO tbl_src(i, j) VALUES (1, 10), (4, 40);
 
     CREATE TABLE tbl_dst(i int primary key, j int) PARTITION BY RANGE(i);
     CREATE TABLE tbl_dst_part_1 PARTITION OF tbl_dst FOR VALUES FROM (1) TO (4);
-    CREATE TABLE tbl_dst_part_2 PARTITION OF tbl_dst FOR VALUES FROM (4) TO (8);
+
+    -- Create a partition with different order of columns, to test that
+    -- partition maps work.
+    CREATE TABLE tbl_dst_part_2(j int, i int primary key);
+    ALTER TABLE tbl_dst ATTACH PARTITION tbl_dst_part_2 FOR VALUES FROM (4) TO (8);
 }
 
 teardown
@@ -66,12 +70,12 @@ BEGIN
 		PERFORM pg_sleep(.1);
 	END LOOP;
 END;
-$$
+$$;
 }
 step do_changes
 {
 	-- Insert one row into each partition.
-	INSERT INTO tbl_src VALUES (2, 2), (3, 3), (5, 5);
+	INSERT INTO tbl_src VALUES (2, 20), (3, 30), (5, 50);
 
 	-- Update with no identity change.
 	UPDATE tbl_src SET j=0 WHERE i=1;

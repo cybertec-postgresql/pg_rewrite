@@ -576,6 +576,7 @@ find_tuple_in_partition(HeapTuple tup, Relation partition,
 						ScanKey key, int nkeys, ItemPointer ctid)
 {
 	Oid			part_oid = RelationGetRelid(partition);
+	HeapTuple	tup_mapped = NULL;
 	PartitionEntry *entry;
 
 	entry = partitions_lookup(partitions, part_oid);
@@ -583,8 +584,25 @@ find_tuple_in_partition(HeapTuple tup, Relation partition,
 		elog(ERROR, "identity index not found for partition %u", part_oid);
 	Assert(entry->part_oid == part_oid);
 
+	/*
+	 * Make sure the tuple so it matches the partition.
+	 */
+	if (entry->conv_map)
+	{
+		/*
+		 * convert_tuple_for_dest_table() is not suitable here because we need
+		 * to keep the original tuple. XXX Should we add a boolean argument to
+		 * the function that indicates whether it should free the original
+		 * tuple?
+		 */
+		tup_mapped = pg_rewrite_execute_attr_map_tuple(tup,
+													   entry->conv_map);
+		tup = tup_mapped;
+	}
 	find_tuple(tup, partition, entry->ident_index, key, nkeys, ctid,
 			   entry->ind_slot);
+	if (tup_mapped)
+		pfree(tup_mapped);
 }
 
 /*
