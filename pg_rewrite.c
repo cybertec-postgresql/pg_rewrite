@@ -84,31 +84,6 @@ static int	index_cat_info_compare(const void *arg1, const void *arg2);
 /* The WAL segment being decoded. */
 XLogSegNo	rewrite_current_segment = 0;
 
-/*
- * Information on a single constraint, needed to compare constraints of the
- * source and the destination relations.
- */
-typedef struct ConstraintInfo
-{
-	char		contype;
-	bool		convalidated;
-	char	   *conbin;
-	NameData	conname;
-	Bitmapset  *attnos;
-
-	Oid			confrelid;
-	int			numfks;
-	AttrNumber	conkey[INDEX_MAX_KEYS];
-	AttrNumber	confkey[INDEX_MAX_KEYS];
-	Oid			pf_eq_oprs[INDEX_MAX_KEYS];
-	Oid			pp_eq_oprs[INDEX_MAX_KEYS];
-	Oid			ff_eq_oprs[INDEX_MAX_KEYS];
-#if PG_VERSION_NUM >= 150000
-	int			num_fk_del_set_cols;
-	AttrNumber	fk_del_set_cols[INDEX_MAX_KEYS];
-#endif
-} ConstraintInfo;
-
 static void worker_shmem_request(void);
 static void worker_shmem_startup(void);
 static void worker_shmem_shutdown(int code, Datum arg);
