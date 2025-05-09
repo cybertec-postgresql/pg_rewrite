@@ -342,7 +342,6 @@ apply_insert(Relation rel, HeapTuple tup, TupleTableSlot *slot,
 	Relation	rel_ins;
 	ResultRelInfo *rri = NULL;
 
-	/* Which partition does the tuple belong to? */
 	if (conv_map)
 		tup = convert_tuple_for_dest_table(tup, conv_map);
 	ExecStoreHeapTuple(tup, slot, false);
@@ -350,6 +349,7 @@ apply_insert(Relation rel, HeapTuple tup, TupleTableSlot *slot,
 	{
 		PartitionEntry	*entry;
 
+		/* Which partition does the tuple belong to? */
 		rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
 								proute, slot, estate);
 		rel_ins = rri->ri_RelationDesc;

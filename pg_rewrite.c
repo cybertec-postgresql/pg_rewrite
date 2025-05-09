@@ -1077,8 +1077,8 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 			 * Build scan key that we'll use to look for rows to be updated /
 			 * deleted during logical decoding.
 			 *
-			 * As all the partitions have the same identity index, there
-			 * should only be a single identity key.
+			 * As all the partitions have the same definition of the identity
+			 * index, there should only be a single identity key.
 			 */
 			if (ident_key == NULL)
 				ident_key = build_identity_key(entry->ident_index,
@@ -1372,9 +1372,9 @@ get_identity_index(Relation rel_dst, Relation rel_src)
 	tupdesc_src = RelationGetDescr(index_src);
 
 	/*
-	 * The tuple descriptors might not be equal, since some attributes of
-	 * rel_dst can have different types. What should match though is attribute
-	 * names and their order.
+	 * The tuple descriptors might not be equal, since some attributes can
+	 * have different types. What should match though is attribute names and
+	 * their order.
 	 */
 	if (tupdesc_src->natts != tupdesc_dst->natts)
 		match = false;
