@@ -29,6 +29,22 @@ static void apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 									 TupleTableSlot	*ind_slot,
 									 partitions_hash *partitions,
 									 TupleConversionMapExt *conv_map);
+static void apply_insert(Relation rel, HeapTuple tup, TupleTableSlot *slot,
+						 EState *estate, ModifyTableState *mtstate,
+						 struct PartitionTupleRouting *proute,
+						 partitions_hash *partitions,
+						 TupleConversionMapExt *conv_map,
+						 BulkInsertState bistate);
+static void apply_update_or_delete(Relation rel, HeapTuple tup,
+								   HeapTuple tup_old,
+								   ConcurrentChangeKind change_kind,
+								   TupleTableSlot *slot, EState *estate,
+								   ScanKey key, int nkeys, Relation ident_index,
+								   TupleTableSlot	*ind_slot,
+								   ModifyTableState *mtstate,
+								   struct PartitionTupleRouting *proute,
+								   partitions_hash *partitions,
+								   TupleConversionMapExt *conv_map);
 static void find_tuple_in_partition(HeapTuple tup, Relation partition,
 									partitions_hash *partitions,
 									ScanKey key, int nkeys, ItemPointer ctid);
@@ -214,7 +230,7 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 						 TupleConversionMapExt *conv_map)
 {
 	TupleTableSlot *slot;
-	BulkInsertState	bistate_nonpart = NULL;
+	BulkInsertState	bistate = NULL;
 	HeapTuple	tup_old = NULL;
 
 	if (dstate->nchanges == 0)
@@ -222,7 +238,7 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 
 	/* See perform_initial_load() */
 	if (proute == NULL)
-		bistate_nonpart = GetBulkInsertState();
+		bistate = GetBulkInsertState();
 
 	/*
 	 * TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples().
@@ -245,7 +261,6 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		ConcurrentChange *change;
 		bool		isnull[1];
 		Datum		values[1];
-		ResultRelInfo *rri = NULL;
 
 		/* Get the change from the single-column tuple. */
 		tup_change = ExecFetchSlotHeapTuple(dstate->tsslot, false, &shouldFree);
@@ -266,279 +281,21 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		}
 		else if (change->kind == CHANGE_INSERT)
 		{
-			List	   *recheck;
-			Relation	rel_ins;
-			BulkInsertState bistate;
-
 			Assert(tup_old == NULL);
-
-			/* Which partition does the tuple belong to? */
-			if (conv_map)
-				tup = convert_tuple_for_dest_table(tup, conv_map);
-			ExecStoreHeapTuple(tup, slot, false);
-			if (proute)
-			{
-				PartitionEntry	*entry;
-
-				rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-										proute, slot, estate);
-				rel_ins = rri->ri_RelationDesc;
-
-				entry = get_partition_entry(partitions,
-											RelationGetRelid(rel_ins));
-				bistate = entry->bistate;
-
-				/*
-				 * Make sure the tuple matches the partition. The typical
-				 * problem we address here is that a partition was attached
-				 * that has a different order of columns.
-				 */
-				if (entry->conv_map)
-				{
-					tup = convert_tuple_for_dest_table(tup, entry->conv_map);
-					ExecClearTuple(slot);
-					ExecStoreHeapTuple(tup, slot, false);
-				}
-			}
-			else
-			{
-				/* Non-partitioned table. */
-				rri = mtstate->resultRelInfo;
-				rel_ins = rel_dst;
-				bistate = bistate_nonpart;
-			}
-			Assert(bistate != NULL);
-			table_tuple_insert(rel_ins, slot, GetCurrentCommandId(true), 0,
-							   bistate);
-
-#if PG_VERSION_NUM < 140000
-			estate->es_result_relation_info = rri;
-#endif
-			/* Update indexes. */
-			recheck = ExecInsertIndexTuples(
-#if PG_VERSION_NUM >= 140000
-											rri,
-#endif
-											slot,
-											estate,
-#if PG_VERSION_NUM >= 140000
-											false,	/* update */
-#endif
-											false,	/* noDupErr */
-											NULL,	/* specConflict */
-											NIL		/* arbiterIndexes */
-#if PG_VERSION_NUM >= 160000
-											, false /* onlySummarizing */
-#endif
-				);
-			ExecClearTuple(slot);
-
-			/*
-			 * If recheck is required, it must have been preformed on the
-			 * source relation by now. (All the logical changes we process
-			 * here are already committed.)
-			 */
-			list_free(recheck);
-			pfree(tup);
-
-			/* Update the progress information. */
-			SpinLockAcquire(&MyWorkerTask->mutex);
-			MyWorkerTask->progress.ins++;
-			SpinLockRelease(&MyWorkerTask->mutex);
+			apply_insert(rel_dst, tup, slot, estate, mtstate, proute,
+						 partitions, conv_map, bistate);
 		}
 		else if (change->kind == CHANGE_UPDATE_NEW ||
 				 change->kind == CHANGE_DELETE)
 		{
-			ResultRelInfo *rri_old = NULL;
+			apply_update_or_delete(rel_dst, tup, tup_old, change->kind,
+								   slot, estate, key, nkeys, ident_index,
+								   ind_slot, mtstate, proute, partitions,
+								   conv_map);
 
-			/* Which partition does the tuple belong to? */
-			if (conv_map)
-				tup = convert_tuple_for_dest_table(tup, conv_map);
-			ExecStoreHeapTuple(tup, slot, false);
-			rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-									proute, slot, estate);
-			ExecClearTuple(slot);
-
-			/* Is this a cross-partition update? */
-			if (partitions && change->kind == CHANGE_UPDATE_NEW && tup_old)
-			{
-				if (conv_map)
-					tup_old = convert_tuple_for_dest_table(tup_old, conv_map);
-				ExecStoreHeapTuple(tup_old, slot, false);
-				rri_old = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-											proute, slot, estate);
-				ExecClearTuple(slot);
-			}
-
-			if (rri_old &&
-				RelationGetRelid(rri_old->ri_RelationDesc) !=
-				RelationGetRelid(rri->ri_RelationDesc))
-			{
-				ItemPointerData ctid;
-				List	   *recheck;
-				PartitionEntry *entry;
-
-				/*
-				 * Cross-partition update. Delete the old tuple from its
-				 * partition.
-				 */
-				find_tuple_in_partition(tup_old, rri_old->ri_RelationDesc,
-										partitions, key, nkeys, &ctid);
-				simple_heap_delete(rri_old->ri_RelationDesc, &ctid);
-
-				/* Update the progress information. */
-				SpinLockAcquire(&MyWorkerTask->mutex);
-				MyWorkerTask->progress.del++;
-				SpinLockRelease(&MyWorkerTask->mutex);
-
-				/*
-				 * Insert the new tuple into its partition. This might include
-				 * conversion to match the partition, see above.
-				 */
-				entry = get_partition_entry(partitions,
-											RelationGetRelid(rri->ri_RelationDesc));
-				if (entry->conv_map)
-					tup = convert_tuple_for_dest_table(tup, entry->conv_map);
-				ExecStoreHeapTuple(tup, slot, false);
-				table_tuple_insert(rri->ri_RelationDesc, slot,
-								   GetCurrentCommandId(true), 0, NULL);
-
-#if PG_VERSION_NUM < 140000
-				estate->es_result_relation_info = rri;
-#endif
-				/* Update indexes. */
-				recheck = ExecInsertIndexTuples(
-#if PG_VERSION_NUM >= 140000
-												rri,
-#endif
-												slot,
-												estate,
-#if PG_VERSION_NUM >= 140000
-												false,	/* update */
-#endif
-												false,	/* noDupErr */
-												NULL,	/* specConflict */
-												NIL		/* arbiterIndexes */
-#if PG_VERSION_NUM >= 160000
-												, false /* onlySummarizing */
-#endif
-					);
-				ExecClearTuple(slot);
-
-				/* Update the progress information. */
-				SpinLockAcquire(&MyWorkerTask->mutex);
-				MyWorkerTask->progress.ins++;
-				SpinLockRelease(&MyWorkerTask->mutex);
-
-				list_free(recheck);
-			}
-			else
-			{
-				HeapTuple	tup_key;
-				ItemPointerData ctid;
-
-				/*
-				 * Both old and new tuple are in the same partition (or the
-				 * target table is not partitioned). Find the tuple to be
-				 * updated or deleted.
-				 */
-				if (change->kind == CHANGE_UPDATE_NEW)
-					tup_key = tup_old != NULL ? tup_old : tup;
-				else
-				{
-					Assert(change->kind == CHANGE_DELETE);
-					Assert(tup_old == NULL);
-					tup_key = tup;
-				}
-
-				if (partitions)
-					find_tuple_in_partition(tup_key, rri->ri_RelationDesc,
-											partitions, key, nkeys, &ctid);
-				else
-					find_tuple(tup_key, rel_dst, ident_index, key, nkeys,
-							   &ctid, ind_slot);
-
-				if (change->kind == CHANGE_UPDATE_NEW)
-				{
-#if PG_VERSION_NUM >= 160000
-					TU_UpdateIndexes	update_indexes;
-#endif
-
-					if (partitions)
-					{
-						PartitionEntry *entry;
-
-						/*
-						 * Make sure the tuple matches the partition.
-						 */
-						entry = get_partition_entry(partitions,
-													RelationGetRelid(rri->ri_RelationDesc));
-						if (entry->conv_map)
-							tup = convert_tuple_for_dest_table(tup,
-															   entry->conv_map);
-					}
-
-					simple_heap_update(rri->ri_RelationDesc, &ctid, tup
-#if PG_VERSION_NUM >= 160000
-									   , &update_indexes
-#endif
-						);
-					if (!HeapTupleIsHeapOnly(tup))
-					{
-						List	   *recheck;
-
-						ExecStoreHeapTuple(tup, slot, false);
-
-						/*
-						 * XXX Consider passing update=true, however it
-						 * requires es_range_table to be initialized. Is it
-						 * worth the complexity?
-						 */
-						recheck = ExecInsertIndexTuples(
-#if PG_VERSION_NUM >= 140000
-														rri,
-#endif
-														slot,
-														estate,
-#if PG_VERSION_NUM >= 140000
-														false,	/* update */
-#endif
-														false,	/* noDupErr */
-														NULL,	/* specConflict */
-														NIL		/* arbiterIndexes */
-#if PG_VERSION_NUM >= 160000
-														/* onlySummarizing */
-														, update_indexes == TU_Summarizing
-#endif
-							);
-						ExecClearTuple(slot);
-						list_free(recheck);
-					}
-
-					/* Update the progress information. */
-					SpinLockAcquire(&MyWorkerTask->mutex);
-					MyWorkerTask->progress.upd++;
-					SpinLockRelease(&MyWorkerTask->mutex);
-				}
-				else
-				{
-					Assert(change->kind == CHANGE_DELETE);
-
-					simple_heap_delete(rri->ri_RelationDesc, &ctid);
-
-					/* Update the progress information. */
-					SpinLockAcquire(&MyWorkerTask->mutex);
-					MyWorkerTask->progress.del++;
-					SpinLockRelease(&MyWorkerTask->mutex);
-				}
-			}
-
-			pfree(tup);
+			/* The function is responsible for freeing. */
 			if (tup_old != NULL)
-			{
-				pfree(tup_old);
 				tup_old = NULL;
-			}
 		}
 		else
 			elog(ERROR, "Unrecognized kind of change: %d", change->kind);
@@ -562,8 +319,304 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 
 	/* Cleanup. */
 	ExecDropSingleTupleTableSlot(slot);
-	if (bistate_nonpart)
-		FreeBulkInsertState(bistate_nonpart);
+	if (bistate)
+		FreeBulkInsertState(bistate);
+}
+
+static void
+apply_insert(Relation rel, HeapTuple tup, TupleTableSlot *slot,
+			 EState *estate, ModifyTableState *mtstate,
+			 struct PartitionTupleRouting *proute,
+			 partitions_hash *partitions, TupleConversionMapExt *conv_map,
+			 BulkInsertState bistate)
+{
+	List	   *recheck;
+	Relation	rel_ins;
+	ResultRelInfo *rri = NULL;
+
+	/* Which partition does the tuple belong to? */
+	if (conv_map)
+		tup = convert_tuple_for_dest_table(tup, conv_map);
+	ExecStoreHeapTuple(tup, slot, false);
+	if (proute)
+	{
+		PartitionEntry	*entry;
+
+		rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
+								proute, slot, estate);
+		rel_ins = rri->ri_RelationDesc;
+
+		entry = get_partition_entry(partitions,
+									RelationGetRelid(rel_ins));
+		bistate = entry->bistate;
+
+		/*
+		 * Make sure the tuple matches the partition. The typical problem we
+		 * address here is that a partition was attached that has a different
+		 * order of columns.
+		 */
+		if (entry->conv_map)
+		{
+			tup = convert_tuple_for_dest_table(tup, entry->conv_map);
+			ExecClearTuple(slot);
+			ExecStoreHeapTuple(tup, slot, false);
+		}
+	}
+	else
+	{
+		/* Non-partitioned table. */
+		rri = mtstate->resultRelInfo;
+		rel_ins = rel;
+		/* Use bistate passed by the caller. */
+	}
+	Assert(bistate != NULL);
+	table_tuple_insert(rel_ins, slot, GetCurrentCommandId(true), 0,
+					   bistate);
+
+#if PG_VERSION_NUM < 140000
+	estate->es_result_relation_info = rri;
+#endif
+	/* Update indexes. */
+	recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 140000
+		rri,
+#endif
+		slot,
+		estate,
+#if PG_VERSION_NUM >= 140000
+		false,	/* update */
+#endif
+		false,	/* noDupErr */
+		NULL,	/* specConflict */
+		NIL		/* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+		, false /* onlySummarizing */
+#endif
+		);
+	ExecClearTuple(slot);
+
+	pfree(tup);
+
+	/*
+	 * If recheck is required, it must have been preformed on the source
+	 * relation by now. (All the logical changes we process here are already
+	 * committed.)
+	 */
+	list_free(recheck);
+
+	/* Update the progress information. */
+	SpinLockAcquire(&MyWorkerTask->mutex);
+	MyWorkerTask->progress.ins++;
+	SpinLockRelease(&MyWorkerTask->mutex);
+}
+
+static void
+apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
+					   ConcurrentChangeKind change_kind,
+					   TupleTableSlot *slot, EState *estate,
+					   ScanKey key, int nkeys, Relation ident_index,
+					   TupleTableSlot	*ind_slot,
+					   ModifyTableState *mtstate,
+					   struct PartitionTupleRouting *proute,
+					   partitions_hash *partitions,
+					   TupleConversionMapExt *conv_map)
+{
+	ResultRelInfo *rri, *rri_old = NULL;
+
+	/*
+	 * Convert the tuple(s) to match the destination table.
+	 */
+	if (conv_map)
+	{
+		tup = convert_tuple_for_dest_table(tup, conv_map);
+
+		if (tup_old)
+		{
+			Assert(change_kind == CHANGE_UPDATE_NEW);
+
+			tup_old = convert_tuple_for_dest_table(tup_old, conv_map);
+		}
+	}
+
+	/* Which partition does the tuple belong to? */
+	ExecStoreHeapTuple(tup, slot, false);
+	rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
+							proute, slot, estate);
+	ExecClearTuple(slot);
+
+	/* Is this a cross-partition update? */
+	if (partitions && change_kind == CHANGE_UPDATE_NEW && tup_old)
+	{
+		ExecStoreHeapTuple(tup_old, slot, false);
+		rri_old = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
+									proute, slot, estate);
+		ExecClearTuple(slot);
+	}
+
+	if (rri_old &&
+		RelationGetRelid(rri_old->ri_RelationDesc) !=
+		RelationGetRelid(rri->ri_RelationDesc))
+	{
+		ItemPointerData ctid;
+		List	   *recheck;
+		PartitionEntry *entry;
+
+		/*
+		 * Cross-partition update. Delete the old tuple from its partition.
+		 */
+		find_tuple_in_partition(tup_old, rri_old->ri_RelationDesc,
+								partitions, key, nkeys, &ctid);
+		simple_heap_delete(rri_old->ri_RelationDesc, &ctid);
+
+		/* Update the progress information. */
+		SpinLockAcquire(&MyWorkerTask->mutex);
+		MyWorkerTask->progress.del++;
+		SpinLockRelease(&MyWorkerTask->mutex);
+
+		/*
+		 * Insert the new tuple into its partition. This might include
+		 * conversion to match the partition, see above.
+		 */
+		entry = get_partition_entry(partitions,
+									RelationGetRelid(rri->ri_RelationDesc));
+		if (entry->conv_map)
+			tup = convert_tuple_for_dest_table(tup, entry->conv_map);
+		ExecStoreHeapTuple(tup, slot, false);
+		table_tuple_insert(rri->ri_RelationDesc, slot,
+						   GetCurrentCommandId(true), 0, NULL);
+
+#if PG_VERSION_NUM < 140000
+		estate->es_result_relation_info = rri;
+#endif
+		/* Update indexes. */
+		recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 140000
+			rri,
+#endif
+			slot,
+			estate,
+#if PG_VERSION_NUM >= 140000
+			false,	/* update */
+#endif
+			false,	/* noDupErr */
+			NULL,	/* specConflict */
+			NIL		/* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+			, false /* onlySummarizing */
+#endif
+			);
+		ExecClearTuple(slot);
+
+		/* Update the progress information. */
+		SpinLockAcquire(&MyWorkerTask->mutex);
+		MyWorkerTask->progress.ins++;
+		SpinLockRelease(&MyWorkerTask->mutex);
+
+		list_free(recheck);
+	}
+	else
+	{
+		HeapTuple	tup_key;
+		ItemPointerData ctid;
+
+		/*
+		 * Both old and new tuple are in the same partition (or the target
+		 * table is not partitioned). Find the tuple to be updated or deleted.
+		 */
+		if (change_kind == CHANGE_UPDATE_NEW)
+			tup_key = tup_old != NULL ? tup_old : tup;
+		else
+		{
+			Assert(change_kind == CHANGE_DELETE);
+			Assert(tup_old == NULL);
+			tup_key = tup;
+		}
+
+		if (partitions)
+			find_tuple_in_partition(tup_key, rri->ri_RelationDesc,
+									partitions, key, nkeys, &ctid);
+		else
+			find_tuple(tup_key, rel, ident_index, key, nkeys, &ctid,
+					   ind_slot);
+
+		if (change_kind == CHANGE_UPDATE_NEW)
+		{
+#if PG_VERSION_NUM >= 160000
+			TU_UpdateIndexes	update_indexes;
+#endif
+
+			if (partitions)
+			{
+				PartitionEntry *entry;
+
+				/*
+				 * Make sure the tuple matches the partition.
+				 */
+				entry = get_partition_entry(partitions,
+											RelationGetRelid(rri->ri_RelationDesc));
+				if (entry->conv_map)
+					tup = convert_tuple_for_dest_table(tup,
+													   entry->conv_map);
+			}
+
+			simple_heap_update(rri->ri_RelationDesc, &ctid, tup
+#if PG_VERSION_NUM >= 160000
+							   , &update_indexes
+#endif
+				);
+			if (!HeapTupleIsHeapOnly(tup))
+			{
+				List	   *recheck;
+
+				ExecStoreHeapTuple(tup, slot, false);
+
+				/*
+				 * XXX Consider passing update=true, however it requires
+				 * es_range_table to be initialized. Is it worth the
+				 * complexity?
+				 */
+				recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 140000
+					rri,
+#endif
+					slot,
+					estate,
+#if PG_VERSION_NUM >= 140000
+					false,	/* update */
+#endif
+					false,	/* noDupErr */
+					NULL,	/* specConflict */
+					NIL		/* arbiterIndexes */
+#if PG_VERSION_NUM >= 160000
+					/* onlySummarizing */
+					, update_indexes == TU_Summarizing
+#endif
+					);
+				ExecClearTuple(slot);
+				list_free(recheck);
+			}
+
+			/* Update the progress information. */
+			SpinLockAcquire(&MyWorkerTask->mutex);
+			MyWorkerTask->progress.upd++;
+			SpinLockRelease(&MyWorkerTask->mutex);
+		}
+		else
+		{
+			Assert(change_kind == CHANGE_DELETE);
+
+			simple_heap_delete(rri->ri_RelationDesc, &ctid);
+
+			/* Update the progress information. */
+			SpinLockAcquire(&MyWorkerTask->mutex);
+			MyWorkerTask->progress.del++;
+			SpinLockRelease(&MyWorkerTask->mutex);
+		}
+	}
+
+	pfree(tup);
+	if (tup_old)
+		pfree(tup_old);
 }
 
 /*
@@ -585,7 +638,7 @@ find_tuple_in_partition(HeapTuple tup, Relation partition,
 	Assert(entry->part_oid == part_oid);
 
 	/*
-	 * Make sure the tuple so it matches the partition.
+	 * Make sure the tuple matches the partition.
 	 */
 	if (entry->conv_map)
 	{
