@@ -96,6 +96,14 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 	DecodingOutputState *dstate;
 	bool		done;
 
+	/*
+	 * Some arguments are specific to partitioned table, some to
+	 * non-partitioned one. XXX Is some refactoring needed here, such as using
+	 * an union?
+	 */
+	Assert((ident_index && ind_slot && partitions == NULL && proute == NULL) ||
+		   (ident_index == NULL && ind_slot == NULL && partitions && proute));
+
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 	done = false;
 	while (!done)
