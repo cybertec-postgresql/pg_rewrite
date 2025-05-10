@@ -79,6 +79,11 @@ static void rewrite_table_impl(char *relschema_src, char *relname_src,
 							   char *relname_new, char *relschema_dst,
 							   char *relname_dst);
 static Relation get_identity_index(Relation rel_dst, Relation rel_src);
+static partitions_hash *get_partitions(Relation rel_src, Relation rel_dst,
+									   int *nparts,
+									   Relation **parts_dst_p,
+									   ScanKey *ident_key_p,
+									   int *ident_key_nentries);
 static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* The WAL segment being decoded. */
@@ -831,11 +836,10 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	RangeVar   *relrv;
 	Relation	rel_src,
 				rel_dst;
-	PartitionDesc part_desc = NULL;
 	Oid			ident_idx_src;
 	Oid			relid_src;
 	Relation	ident_index = NULL;
-	ScanKey		ident_key = NULL;
+	ScanKey		ident_key;
 	TupleTableSlot	*ind_slot = NULL;
 	int			i,
 				ident_key_nentries = 0;
@@ -852,6 +856,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	IndexCatInfo *ind_info;
 	bool		source_finalized;
 	Relation   *parts_dst = NULL;
+	int		nparts;
 	partitions_hash *partitions = NULL;
 	TupleConversionMapExt *conv_map;
 	EState	   *estate;
@@ -980,31 +985,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 				 errmsg("\"%s\" is not a permanent table", relname_dst)));
 
 	/*
-	 * Are we going to route the data into partitions?
-	 */
-	if (rel_dst->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-	{
-#if PG_VERSION_NUM >= 140000
-		part_desc = RelationGetPartitionDesc(rel_dst, true);
-#else
-		part_desc = RelationGetPartitionDesc(rel_dst);
-#endif
-		if (part_desc->nparts == 0)
-			ereport(ERROR,
-					(errmsg("table \"%s\" has no partitions", relname_dst)));
-
-		/*
-		 * It's probably not necessary to lock the partitions in exclusive
-		 * mode, but we'll need to open them later. Simply use the exclusive
-		 * lock instead of trying to determine the minimum lock level needed.
-		 */
-		parts_dst = (Relation *) palloc(part_desc->nparts * sizeof(Relation));
-		for (i = 0; i < part_desc->nparts; i++)
-			parts_dst[i] = table_open(part_desc->oids[i],
-									  AccessExclusiveLock);
-	}
-
-	/*
 	 * Build a "historic snapshot", i.e. one that reflect the table state at
 	 * the moment the snapshot builder reached SNAPBUILD_CONSISTENT state.
 	 */
@@ -1027,64 +1007,12 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	conv_map = convert_tuples_by_name_ext(CreateTupleDescCopy(RelationGetDescr(rel_src)),
 										  RelationGetDescr(rel_dst));
 
-	/* TODO Move this branch into a function. */
-	if (part_desc)
-	{
-		/*
-		 * Pointers to identity indexes will be looked up by the partition
-		 * relation OID.
-		 */
-		partitions = partitions_create(CurrentMemoryContext, 8, NULL);
-
-		/*
-		 * Gather partition information that we'll need later. It happens here
-		 * because it's a good opportunity to check the partition tuple
-		 * descriptors and identity indexes before the initial load starts. (The
-		 * load does not need those indexes, but it'd be unfortunate to find out
-		 * incorrect or missing identity index after the initial load has been
-		 * performed.)
-		 */
-		for (i = 0; i < part_desc->nparts; i++)
-		{
-			Relation	partition = parts_dst[i];
-			PartitionEntry *entry;
-			bool		found;
-
-			/* Info on partitions. */
-			entry = partitions_insert(partitions, RelationGetRelid(partition),
-									  &found);
-			Assert(!found);
-
-			/*
-			 * Identity of the rows of a foreign table is hard to implement for
-			 * foreign tables. We'd hit the problem below, but it's clearer to
-			 * report the problem this way.
-			 */
-			if (partition->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
-				ereport(ERROR,
-						(errmsg("\"%s\" is a foreign table",
-								RelationGetRelationName(partition))));
-
-			entry->ident_index = get_identity_index(partition, rel_src);
-			entry->ind_slot = table_slot_create(partition, NULL);
-			entry->conv_map =
-				convert_tuples_by_name_ext(RelationGetDescr(rel_dst),
-										   RelationGetDescr(partition));
-			/* Expect many insertions. */
-			entry->bistate = GetBulkInsertState();
-
-			/*
-			 * Build scan key that we'll use to look for rows to be updated /
-			 * deleted during logical decoding.
-			 *
-			 * As all the partitions have the same definition of the identity
-			 * index, there should only be a single identity key.
-			 */
-			if (ident_key == NULL)
-				ident_key = build_identity_key(entry->ident_index,
-											   &ident_key_nentries);
-		}
-	}
+	/*
+	 * Are we going to route the data into partitions?
+	 */
+	if (rel_dst->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		partitions = get_partitions(rel_src, rel_dst, &nparts, &parts_dst,
+									&ident_key, &ident_key_nentries);
 	else
 	{
 		ident_index = get_identity_index(rel_dst, rel_src);
@@ -1314,11 +1242,11 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	table_close(rel_dst, AccessExclusiveLock);
 
-	if (part_desc)
+	if (partitions)
 	{
 		close_partitions(partitions);
 
-		for (i = 0; i < part_desc->nparts; i++)
+		for (i = 0; i < nparts; i++)
 			table_close(parts_dst[i], AccessExclusiveLock);
 		pfree(parts_dst);
 	}
@@ -1405,6 +1333,103 @@ get_identity_index(Relation rel_dst, Relation rel_src)
 	index_close(index_src, AccessShareLock);
 
 	return index_dst;
+}
+
+/*
+ * Retrieve information needed to apply DML commands to partitioned table.
+ */
+static partitions_hash *
+get_partitions(Relation rel_src, Relation rel_dst, int *nparts,
+			   Relation **parts_dst_p, ScanKey *ident_key_p,
+			   int *ident_key_nentries)
+{
+	partitions_hash *partitions;
+	Relation   *parts_dst;
+	ScanKey		ident_key = NULL;
+	PartitionDesc part_desc;
+
+#if PG_VERSION_NUM >= 140000
+	part_desc = RelationGetPartitionDesc(rel_dst, true);
+#else
+	part_desc = RelationGetPartitionDesc(rel_dst);
+#endif
+	if (part_desc->nparts == 0)
+		ereport(ERROR,
+				(errmsg("table \"%s\" has no partitions",
+						RelationGetRelationName(rel_dst))));
+
+	/*
+	 * It's probably not necessary to lock the partitions in exclusive mode,
+	 * but we'll need to open them later. Simply use the exclusive lock
+	 * instead of trying to determine the minimum lock level needed.
+	 */
+	parts_dst = (Relation *) palloc(part_desc->nparts * sizeof(Relation));
+	for (int i = 0; i < part_desc->nparts; i++)
+		parts_dst[i] = table_open(part_desc->oids[i],
+								  AccessExclusiveLock);
+
+	/*
+	 * Pointers to identity indexes will be looked up by the partition
+	 * relation OID.
+	 */
+	partitions = partitions_create(CurrentMemoryContext, 8, NULL);
+
+	/*
+	 * Gather partition information that we'll need later. It happens here
+	 * because it's a good opportunity to check the partition tuple
+	 * descriptors and identity indexes before the initial load starts. (The
+	 * load does not need those indexes, but it'd be unfortunate to find out
+	 * incorrect or missing identity index after the initial load has been
+	 * performed.)
+	 */
+	for (int i = 0; i < part_desc->nparts; i++)
+	{
+		Relation	partition = parts_dst[i];
+		PartitionEntry *entry;
+		bool		found;
+
+		/* Info on partitions. */
+		entry = partitions_insert(partitions, RelationGetRelid(partition),
+								  &found);
+		Assert(!found);
+
+		/*
+		 * Identity of the rows of a foreign table is hard to implement for
+		 * foreign tables. We'd hit the problem below, but it's clearer to
+		 * report the problem this way.
+		 */
+		if (partition->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+			ereport(ERROR,
+					(errmsg("\"%s\" is a foreign table",
+							RelationGetRelationName(partition))));
+
+		entry->ident_index = get_identity_index(partition, rel_src);
+		entry->ind_slot = table_slot_create(partition, NULL);
+		entry->conv_map =
+			convert_tuples_by_name_ext(RelationGetDescr(rel_dst),
+									   RelationGetDescr(partition));
+		/* Expect many insertions. */
+		entry->bistate = GetBulkInsertState();
+
+		/*
+		 * Build scan key that we'll use to look for rows to be updated /
+		 * deleted during logical decoding.
+		 *
+		 * As all the partitions have the same definition of the identity
+		 * index, there should only be a single identity key.
+		 */
+		if (ident_key == NULL)
+		{
+			ident_key = build_identity_key(entry->ident_index,
+										   ident_key_nentries);
+			*ident_key_p = ident_key;
+		}
+	}
+
+	*nparts = part_desc->nparts;
+	*parts_dst_p = parts_dst;
+
+	return partitions;
 }
 
 static int
