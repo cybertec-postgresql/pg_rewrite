@@ -78,9 +78,9 @@ typedef struct DecodingOutputState
 	TupleDesc	tupdesc_change;
 
 	/*
-	 * Tuple descriptor needed to apply the concurrent changes.
+	 * Tuple descriptor needed process the concurrent data changes.
 	 */
-	TupleDesc	tupdesc;
+	TupleDesc	tupdesc_src;
 
 	/* Slot to retrieve data from tstore. */
 	TupleTableSlot *tsslot;
@@ -302,8 +302,16 @@ typedef struct PartitionEntry
 	Oid			part_oid;		/* key */
 	Relation	ident_index;
 
-	/* Slot to retrieve tuples from identity index. */
-	TupleTableSlot *ind_slot;
+	/*
+	 * Slot (TTSOpsHeapTuple) to apply data changes to the partition.
+	 */
+	TupleTableSlot *slot;
+
+	/*
+	 * Slot to retrieve tuples from the partition. Separate from 'slot_ind'
+	 * because it has to be TTSOpsBufferHeapTuple.
+	 */
+	TupleTableSlot *slot_ind;
 
 	/* This should make insertions into partitions more efficient. */
 	BulkInsertState bistate;
@@ -345,11 +353,10 @@ extern bool pg_rewrite_process_concurrent_changes(EState *estate,
 												  LogicalDecodingContext *ctx,
 												  XLogRecPtr end_of_wal,
 												  CatalogState *cat_state,
-												  Relation rel_dst,
 												  ScanKey ident_key,
 												  int ident_key_nentries,
 												  Relation ident_index,
-												  TupleTableSlot *ind_slot,
+												  TupleTableSlot *slot_dst_ind,
 												  LOCKMODE lock_held,
 												  partitions_hash *partitions,
 												  TupleConversionMapExt *conv_map,

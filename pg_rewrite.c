@@ -138,10 +138,10 @@ static bool perform_final_merge(EState *estate,
 								ModifyTableState *mtstate,
 								struct PartitionTupleRouting *proute,
 								Oid relid_src, Oid *indexes_src, int nindexes,
-								Relation rel_dst, ScanKey ident_key,
+								ScanKey ident_key,
 								int ident_key_nentries,
 								Relation ident_index,
-								TupleTableSlot *ind_slot,
+								TupleTableSlot *slot_dst_ind,
 								CatalogState *cat_state,
 								LogicalDecodingContext *ctx,
 								partitions_hash *ident_indexes,
@@ -847,7 +847,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	Oid			relid_src;
 	Relation	ident_index = NULL;
 	ScanKey		ident_key;
-	TupleTableSlot	*ind_slot = NULL;
+	TupleTableSlot	*slot_dst_ind = NULL;
 	int			i,
 				ident_key_nentries = 0;
 	LogicalDecodingContext *ctx;
@@ -984,12 +984,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 				 errmsg("\"%s\" is not a permanent table", relname_dst)));
 
 	/*
-	 * Now that we have locked rel_dst, get its tuple descriptor.
-	 */
-	((DecodingOutputState *) ctx->output_writer_private)->tupdesc =
-		RelationGetDescr(rel_dst);
-
-	/*
 	 * Build a "historic snapshot", i.e. one that reflect the table state at
 	 * the moment the snapshot builder reached SNAPBUILD_CONSISTENT state.
 	 */
@@ -997,6 +991,15 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 
 	/* The source relation will be needed for the initial load. */
 	rel_src = table_open(relid_src, AccessShareLock);
+
+	/*
+	 * Now that we have opened rel_src, get its tuple descriptor.
+	 *
+	 * Copy is needed because we'll close the relation before using the tuple
+	 * descriptor.
+	 */
+	((DecodingOutputState *) ctx->output_writer_private)->tupdesc_src =
+		CreateTupleDescCopy(RelationGetDescr(rel_src));
 
 	/*
 	 * Create a conversion map so that we can handle difference(s) in the
@@ -1022,8 +1025,9 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	{
 		ident_index = get_identity_index(rel_dst, rel_src);
 		ident_key = build_identity_key(ident_index, &ident_key_nentries);
-		ind_slot = table_slot_create(rel_dst, NULL);
+		slot_dst_ind = table_slot_create(rel_dst, NULL);
 	}
+
 	Assert(ident_key_nentries > 0);
 
 	/*
@@ -1146,11 +1150,10 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 										  ctx,
 										  end_of_wal,
 										  cat_state,
-										  rel_dst,
 										  ident_key,
 										  ident_key_nentries,
 										  ident_index,
-										  ind_slot,
+										  slot_dst_ind,
 										  NoLock,
 										  partitions,
 										  conv_map,
@@ -1189,8 +1192,8 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	{
 		if (perform_final_merge(estate, mtstate, proute,
 								relid_src, indexes_src, nindexes,
-								rel_dst, ident_key, ident_key_nentries,
-								ident_index, ind_slot,
+								ident_key, ident_key_nentries,
+								ident_index, slot_dst_ind,
 								cat_state, ctx, partitions, conv_map))
 		{
 			source_finalized = true;
@@ -1258,7 +1261,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	else
 	{
 		index_close(ident_index, AccessShareLock);
-		ExecDropSingleTupleTableSlot(ind_slot);
+		ExecDropSingleTupleTableSlot(slot_dst_ind);
 	}
 
 	if (nindexes > 0)
@@ -1409,7 +1412,9 @@ get_partitions(Relation rel_src, Relation rel_dst, int *nparts,
 							RelationGetRelationName(partition))));
 
 		entry->ident_index = get_identity_index(partition, rel_src);
-		entry->ind_slot = table_slot_create(partition, NULL);
+		entry->slot_ind = table_slot_create(partition, NULL);
+		entry->slot =  MakeSingleTupleTableSlot(RelationGetDescr(rel_dst),
+												&TTSOpsHeapTuple);
 		entry->conv_map =
 			convert_tuples_by_name_ext(RelationGetDescr(rel_dst),
 									   RelationGetDescr(partition));
@@ -1630,6 +1635,7 @@ decoding_cleanup(LogicalDecodingContext *ctx)
 
 	ExecDropSingleTupleTableSlot(dstate->tsslot);
 	FreeTupleDesc(dstate->tupdesc_change);
+	FreeTupleDesc(dstate->tupdesc_src);
 	tuplestore_end(dstate->tstore);
 
 	FreeDecodingContext(ctx);
@@ -2964,10 +2970,10 @@ perform_final_merge(EState *estate,
 					ModifyTableState *mtstate,
 					struct PartitionTupleRouting *proute,
 					Oid relid_src, Oid *indexes_src, int nindexes,
-					Relation rel_dst, ScanKey ident_key,
+					ScanKey ident_key,
 					int ident_key_nentries,
 					Relation ident_index,
-					TupleTableSlot	*ind_slot,
+					TupleTableSlot *slot_dst_ind,
 					CatalogState *cat_state,
 					LogicalDecodingContext *ctx,
 					partitions_hash *partitions,
@@ -3081,11 +3087,10 @@ perform_final_merge(EState *estate,
 													ctx,
 													end_of_wal,
 													cat_state,
-													rel_dst,
 													ident_key,
 													ident_key_nentries,
 													ident_index,
-													ind_slot,
+													slot_dst_ind,
 													AccessExclusiveLock,
 													partitions,
 													conv_map,
@@ -3112,11 +3117,10 @@ perform_final_merge(EState *estate,
 											  ctx,
 											  end_of_wal,
 											  cat_state,
-											  rel_dst,
 											  ident_key,
 											  ident_key_nentries,
 											  ident_index,
-											  ind_slot,
+											  slot_dst_ind,
 											  AccessExclusiveLock,
 											  partitions,
 											  conv_map,
@@ -3140,7 +3144,8 @@ close_partitions(partitions_hash *partitions)
 	while ((entry = partitions_iterate(partitions, &iterator)) != NULL)
 	{
 		index_close(entry->ident_index, AccessShareLock);
-		ExecDropSingleTupleTableSlot(entry->ind_slot);
+		ExecDropSingleTupleTableSlot(entry->slot);
+		ExecDropSingleTupleTableSlot(entry->slot_ind);
 		if (entry->conv_map)
 			free_conversion_map_ext(entry->conv_map);
 		FreeBulkInsertState(entry->bistate);

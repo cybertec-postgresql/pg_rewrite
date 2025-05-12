@@ -22,25 +22,25 @@
 
 static void apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 									 struct PartitionTupleRouting *proute,
-									 Relation rel_dst,
 									 DecodingOutputState *dstate,
 									 ScanKey key, int nkeys,
 									 Relation ident_index,
-									 TupleTableSlot	*ind_slot,
+									 TupleTableSlot	*slot_dst_ind,
 									 partitions_hash *partitions,
 									 TupleConversionMapExt *conv_map);
-static void apply_insert(Relation rel, HeapTuple tup, TupleTableSlot *slot,
+static void apply_insert(HeapTuple tup, TupleTableSlot *slot,
 						 EState *estate, ModifyTableState *mtstate,
 						 struct PartitionTupleRouting *proute,
 						 partitions_hash *partitions,
 						 TupleConversionMapExt *conv_map,
 						 BulkInsertState bistate);
-static void apply_update_or_delete(Relation rel, HeapTuple tup,
+static void apply_update_or_delete(HeapTuple tup,
 								   HeapTuple tup_old,
 								   ConcurrentChangeKind change_kind,
-								   TupleTableSlot *slot, EState *estate,
+								   EState *estate,
 								   ScanKey key, int nkeys, Relation ident_index,
-								   TupleTableSlot	*ind_slot,
+								   TupleTableSlot *slot_dst,
+								   TupleTableSlot *slot_dst_ind,
 								   ModifyTableState *mtstate,
 								   struct PartitionTupleRouting *proute,
 								   partitions_hash *partitions,
@@ -50,7 +50,7 @@ static void find_tuple_in_partition(HeapTuple tup, Relation partition,
 									ScanKey key, int nkeys, ItemPointer ctid);
 static void find_tuple(HeapTuple tup, Relation rel, Relation ident_index,
 					   ScanKey key, int nkeys, ItemPointer ctid,
-					   TupleTableSlot *ind_slot);
+					   TupleTableSlot *slot_dst_ind);
 static bool processing_time_elapsed(struct timeval *utmost);
 
 static void plugin_startup(LogicalDecodingContext *ctx,
@@ -84,10 +84,10 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 									  LogicalDecodingContext *ctx,
 									  XLogRecPtr end_of_wal,
 									  CatalogState *cat_state,
-									  Relation rel_dst, ScanKey ident_key,
+									  ScanKey ident_key,
 									  int ident_key_nentries,
 									  Relation ident_index,
-									  TupleTableSlot *ind_slot,
+									  TupleTableSlot *slot_dst_ind,
 									  LOCKMODE lock_held,
 									  partitions_hash *partitions,
 									  TupleConversionMapExt *conv_map,
@@ -101,8 +101,10 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 	 * non-partitioned one. XXX Is some refactoring needed here, such as using
 	 * an union?
 	 */
-	Assert((ident_index && ind_slot && partitions == NULL && proute == NULL) ||
-		   (ident_index == NULL && ind_slot == NULL && partitions && proute));
+	Assert((ident_index && slot_dst_ind && partitions == NULL
+			&& proute == NULL) ||
+		   (ident_index == NULL && slot_dst_ind == NULL&&
+			partitions && proute));
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 	done = false;
@@ -128,9 +130,10 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 		 * processing partway through. Partial cleanup of the tuplestore seems
 		 * non-trivial.
 		 */
-		apply_concurrent_changes(estate, mtstate, proute, rel_dst,
+		apply_concurrent_changes(estate, mtstate, proute,
 								 dstate, ident_key, ident_key_nentries,
-								 ident_index, ind_slot, partitions, conv_map);
+								 ident_index, slot_dst_ind,
+								 partitions, conv_map);
 	}
 
 	return true;
@@ -229,17 +232,17 @@ pg_rewrite_decode_concurrent_changes(LogicalDecodingContext *ctx,
 static void
 apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 						 struct PartitionTupleRouting *proute,
-						 Relation rel_dst,
 						 DecodingOutputState *dstate,
 						 ScanKey key, int nkeys,
 						 Relation ident_index,
-						 TupleTableSlot	*ind_slot,
+						 TupleTableSlot	*slot_dst_ind,
 						 partitions_hash *partitions,
 						 TupleConversionMapExt *conv_map)
 {
-	TupleTableSlot *slot;
 	BulkInsertState	bistate = NULL;
 	HeapTuple	tup_old = NULL;
+	Relation	rel_dst;
+	TupleTableSlot	*slot_dst;
 
 	if (dstate->nchanges == 0)
 		return;
@@ -249,9 +252,12 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		bistate = GetBulkInsertState();
 
 	/*
-	 * TupleTableSlot is needed to pass the tuple to ExecInsertIndexTuples().
+	 * Slot for the destination relation is needed even in the partitioned
+	 * case, to route changes to partitions.
 	 */
-	slot = MakeSingleTupleTableSlot(dstate->tupdesc, &TTSOpsHeapTuple);
+	rel_dst = mtstate->resultRelInfo->ri_RelationDesc;
+	slot_dst = MakeSingleTupleTableSlot(RelationGetDescr(rel_dst),
+										&TTSOpsHeapTuple);
 
 	/*
 	 * In case functions in the index need the active snapshot and caller
@@ -290,16 +296,16 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		else if (change->kind == CHANGE_INSERT)
 		{
 			Assert(tup_old == NULL);
-			apply_insert(rel_dst, tup, slot, estate, mtstate, proute,
+			apply_insert(tup, slot_dst, estate, mtstate, proute,
 						 partitions, conv_map, bistate);
 		}
 		else if (change->kind == CHANGE_UPDATE_NEW ||
 				 change->kind == CHANGE_DELETE)
 		{
-			apply_update_or_delete(rel_dst, tup, tup_old, change->kind,
-								   slot, estate, key, nkeys, ident_index,
-								   ind_slot, mtstate, proute, partitions,
-								   conv_map);
+			apply_update_or_delete(tup, tup_old, change->kind,
+								   estate, key, nkeys, ident_index,
+								   slot_dst, slot_dst_ind, mtstate, proute,
+								   partitions, conv_map);
 
 			/* The function is responsible for freeing. */
 			if (tup_old != NULL)
@@ -326,13 +332,14 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 	PopActiveSnapshot();
 
 	/* Cleanup. */
-	ExecDropSingleTupleTableSlot(slot);
 	if (bistate)
 		FreeBulkInsertState(bistate);
+
+	ExecDropSingleTupleTableSlot(slot_dst);
 }
 
 static void
-apply_insert(Relation rel, HeapTuple tup, TupleTableSlot *slot,
+apply_insert(HeapTuple tup, TupleTableSlot *slot,
 			 EState *estate, ModifyTableState *mtstate,
 			 struct PartitionTupleRouting *proute,
 			 partitions_hash *partitions, TupleConversionMapExt *conv_map,
@@ -419,11 +426,12 @@ apply_insert(Relation rel, HeapTuple tup, TupleTableSlot *slot,
 }
 
 static void
-apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
+apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 					   ConcurrentChangeKind change_kind,
-					   TupleTableSlot *slot, EState *estate,
+					   EState *estate,
 					   ScanKey key, int nkeys, Relation ident_index,
-					   TupleTableSlot	*ind_slot,
+					   TupleTableSlot *slot_dst,
+					   TupleTableSlot *slot_dst_ind,
 					   ModifyTableState *mtstate,
 					   struct PartitionTupleRouting *proute,
 					   partitions_hash *partitions,
@@ -450,17 +458,17 @@ apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
 	if (proute)
 	{
 		/* Which partition does the tuple belong to? */
-		ExecStoreHeapTuple(tup, slot, false);
+		ExecStoreHeapTuple(tup, slot_dst, false);
 		rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-								proute, slot, estate);
-		ExecClearTuple(slot);
+								proute, slot_dst, estate);
+		ExecClearTuple(slot_dst);
 
 		if (change_kind == CHANGE_UPDATE_NEW && tup_old)
 		{
-			ExecStoreHeapTuple(tup_old, slot, false);
+			ExecStoreHeapTuple(tup_old, slot_dst, false);
 			rri_old = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-										proute, slot, estate);
-			ExecClearTuple(slot);
+										proute, slot_dst, estate);
+			ExecClearTuple(slot_dst);
 		}
 	}
 	else
@@ -495,8 +503,8 @@ apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
 									RelationGetRelid(rri->ri_RelationDesc));
 		if (entry->conv_map)
 			tup = convert_tuple_for_dest_table(tup, entry->conv_map);
-		ExecStoreHeapTuple(tup, slot, false);
-		table_tuple_insert(rri->ri_RelationDesc, slot,
+		ExecStoreHeapTuple(tup, entry->slot, false);
+		table_tuple_insert(rri->ri_RelationDesc, entry->slot,
 						   GetCurrentCommandId(true), 0, NULL);
 
 #if PG_VERSION_NUM < 140000
@@ -507,7 +515,7 @@ apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
 #if PG_VERSION_NUM >= 140000
 			rri,
 #endif
-			slot,
+			entry->slot,
 			estate,
 #if PG_VERSION_NUM >= 140000
 			false,	/* update */
@@ -519,7 +527,7 @@ apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
 			, false /* onlySummarizing */
 #endif
 			);
-		ExecClearTuple(slot);
+		ExecClearTuple(entry->slot);
 
 		/* Update the progress information. */
 		SpinLockAcquire(&MyWorkerTask->mutex);
@@ -534,8 +542,8 @@ apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
 		ItemPointerData ctid;
 
 		/*
-		 * Both old and new tuple are in the same partition (or the target
-		 * table is not partitioned). Find the tuple to be updated or deleted.
+		 * Both old and new tuple are in the same partition, or the target
+		 * table is not partitioned. Find the tuple to be updated or deleted.
 		 */
 		if (change_kind == CHANGE_UPDATE_NEW)
 			tup_key = tup_old != NULL ? tup_old : tup;
@@ -550,19 +558,19 @@ apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
 			find_tuple_in_partition(tup_key, rri->ri_RelationDesc,
 									partitions, key, nkeys, &ctid);
 		else
-			find_tuple(tup_key, rel, ident_index, key, nkeys, &ctid,
-					   ind_slot);
+			find_tuple(tup_key, rri->ri_RelationDesc, ident_index, key, nkeys,
+					   &ctid, slot_dst_ind);
 
 		if (change_kind == CHANGE_UPDATE_NEW)
 		{
+			PartitionEntry *entry = NULL;
+
 #if PG_VERSION_NUM >= 160000
 			TU_UpdateIndexes	update_indexes;
 #endif
 
 			if (partitions)
 			{
-				PartitionEntry *entry;
-
 				/*
 				 * Make sure the tuple matches the partition.
 				 */
@@ -580,7 +588,10 @@ apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
 				);
 			if (!HeapTupleIsHeapOnly(tup))
 			{
+				TupleTableSlot	*slot;
 				List	   *recheck;
+
+				slot = entry ? entry->slot : slot_dst;
 
 				ExecStoreHeapTuple(tup, slot, false);
 
@@ -667,7 +678,7 @@ find_tuple_in_partition(HeapTuple tup, Relation partition,
 		tup = tup_mapped;
 	}
 	find_tuple(tup, partition, entry->ident_index, key, nkeys, ctid,
-			   entry->ind_slot);
+			   entry->slot_ind);
 	if (tup_mapped)
 		pfree(tup_mapped);
 }
@@ -678,7 +689,7 @@ find_tuple_in_partition(HeapTuple tup, Relation partition,
  */
 static void
 find_tuple(HeapTuple tup, Relation rel, Relation ident_index, ScanKey key,
-		   int nkeys, ItemPointer ctid, TupleTableSlot *ind_slot)
+		   int nkeys, ItemPointer ctid, TupleTableSlot *slot_dst_ind)
 {
 	Form_pg_index ident_form;
 	int2vector *ident_indkey;
@@ -706,11 +717,11 @@ find_tuple(HeapTuple tup, Relation rel, Relation ident_index, ScanKey key,
 										  &isnull);
 		Assert(!isnull);
 	}
-	if (index_getnext_slot(scan, ForwardScanDirection, ind_slot))
+	if (index_getnext_slot(scan, ForwardScanDirection, slot_dst_ind))
 	{
 		bool		shouldFreeInd;
 
-		tup_exist = ExecFetchSlotHeapTuple(ind_slot, false,
+		tup_exist = ExecFetchSlotHeapTuple(slot_dst_ind, false,
 										   &shouldFreeInd);
 		/* TTSOpsBufferHeapTuple has .get_heap_tuple != NULL. */
 		Assert(!shouldFreeInd);
@@ -935,7 +946,7 @@ store_change(LogicalDecodingContext *ctx, ConcurrentChangeKind kind,
 		 * toast_flatten_tuple_to_datum() might be more convenient but we
 		 * don't want the decompression it does.
 		 */
-		tuple = toast_flatten_tuple(tuple, dstate->tupdesc);
+		tuple = toast_flatten_tuple(tuple, dstate->tupdesc_src);
 		flattened = true;
 	}
 

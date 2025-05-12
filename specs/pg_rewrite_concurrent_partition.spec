@@ -6,12 +6,13 @@ setup
     CREATE TABLE tbl_src(i int primary key, j int);
     INSERT INTO tbl_src(i, j) VALUES (1, 10), (4, 40);
 
-    CREATE TABLE tbl_dst(i int primary key, j int) PARTITION BY RANGE(i);
+    -- Besides partitioning, also test change of column type (int -> bigint).
+    CREATE TABLE tbl_dst(i bigint primary key, j int) PARTITION BY RANGE(i);
     CREATE TABLE tbl_dst_part_1 PARTITION OF tbl_dst FOR VALUES FROM (1) TO (4);
 
     -- Create a partition with different order of columns, to test that
     -- partition maps work.
-    CREATE TABLE tbl_dst_part_2(j int, i int primary key);
+    CREATE TABLE tbl_dst_part_2(j int, i bigint primary key);
     ALTER TABLE tbl_dst ATTACH PARTITION tbl_dst_part_2 FOR VALUES FROM (4) TO (8);
 }
 
