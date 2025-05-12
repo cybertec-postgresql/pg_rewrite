@@ -4,10 +4,15 @@ setup
     CREATE EXTENSION pg_rewrite;
 
     CREATE TABLE tbl_src(i int primary key, j int);
-    INSERT INTO tbl_src(i, j) VALUES (1, 10), (4, 40), (7, 70);
+    INSERT INTO tbl_src(i, j) VALUES (1, 10), (4, 40);
 
-    -- Change of data type and column order.
-    CREATE TABLE tbl_dst(j int, i bigint primary key);
+    CREATE TABLE tbl_dst(i int primary key, j int) PARTITION BY RANGE(i);
+    CREATE TABLE tbl_dst_part_1 PARTITION OF tbl_dst FOR VALUES FROM (1) TO (4);
+
+    -- Create a partition with different order of columns, to test that
+    -- partition maps work.
+    CREATE TABLE tbl_dst_part_2(j int, i int primary key);
+    ALTER TABLE tbl_dst ATTACH PARTITION tbl_dst_part_2 FOR VALUES FROM (4) TO (8);
 }
 
 teardown
@@ -70,21 +75,23 @@ $$;
 }
 step do_changes
 {
+	-- Insert one row into each partition.
 	INSERT INTO tbl_src VALUES (2, 20), (3, 30), (5, 50);
 
 	-- Update with no identity change.
 	UPDATE tbl_src SET j=0 WHERE i=1;
 
-	-- Update with identity change.
-	UPDATE tbl_src SET i=6 WHERE i=4;
+	-- Update with identity change but within the same partition.
+	UPDATE tbl_src SET i=6 WHERE i=5;
 
-	-- Update a row we inserted, to check that the insertion is visible.
-	UPDATE tbl_src SET j=7 WHERE i=2;
-	-- ... and update it again, to check that the update is visible.
-	UPDATE tbl_src SET j=8 WHERE j=7;
+	-- Cross-partition update.
+	UPDATE tbl_src SET i=7 WHERE i=3;
+
+	-- Update a row we inserted and updated, to check that it's visible.
+	UPDATE tbl_src SET j=4 WHERE i=7;
 
 	-- Delete.
-	DELETE FROM tbl_src WHERE i=7;
+	DELETE FROM tbl_src WHERE i=4;
 }
 step wakeup_before_lock_ip
 {
@@ -110,7 +117,7 @@ BEGIN
 		PERFORM pg_sleep(.1);
 	END LOOP;
 END;
-$$;
+$$
 }
 # Like wakeup_before_lock_ip above.
 step wakeup_after_commit_ip

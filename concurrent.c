@@ -374,7 +374,7 @@ apply_insert(Relation rel, HeapTuple tup, TupleTableSlot *slot,
 	{
 		/* Non-partitioned table. */
 		rri = mtstate->resultRelInfo;
-		rel_ins = rel;
+		rel_ins = rri->ri_RelationDesc;
 		/* Use bistate passed by the caller. */
 	}
 	Assert(bistate != NULL);
@@ -446,21 +446,27 @@ apply_update_or_delete(Relation rel, HeapTuple tup, HeapTuple tup_old,
 		}
 	}
 
-	/* Which partition does the tuple belong to? */
-	ExecStoreHeapTuple(tup, slot, false);
-	rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-							proute, slot, estate);
-	ExecClearTuple(slot);
+	/* Is the destination table partitioned? */
+	if (proute)
+	{
+		/* Which partition does the tuple belong to? */
+		ExecStoreHeapTuple(tup, slot, false);
+		rri = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
+								proute, slot, estate);
+		ExecClearTuple(slot);
+
+		if (change_kind == CHANGE_UPDATE_NEW && tup_old)
+		{
+			ExecStoreHeapTuple(tup_old, slot, false);
+			rri_old = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
+										proute, slot, estate);
+			ExecClearTuple(slot);
+		}
+	}
+	else
+		rri = mtstate->resultRelInfo;
 
 	/* Is this a cross-partition update? */
-	if (partitions && change_kind == CHANGE_UPDATE_NEW && tup_old)
-	{
-		ExecStoreHeapTuple(tup_old, slot, false);
-		rri_old = ExecFindPartition(mtstate, mtstate->rootResultRelInfo,
-									proute, slot, estate);
-		ExecClearTuple(slot);
-	}
-
 	if (rri_old &&
 		RelationGetRelid(rri_old->ri_RelationDesc) !=
 		RelationGetRelid(rri->ri_RelationDesc))

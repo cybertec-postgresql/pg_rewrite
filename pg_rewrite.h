@@ -77,7 +77,9 @@ typedef struct DecodingOutputState
 	 */
 	TupleDesc	tupdesc_change;
 
-	/* Tuple descriptor needed to update indexes. */
+	/*
+	 * Tuple descriptor needed to apply the concurrent changes.
+	 */
 	TupleDesc	tupdesc;
 
 	/* Slot to retrieve data from tstore. */

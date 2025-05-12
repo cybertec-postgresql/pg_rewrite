@@ -34,21 +34,23 @@ END;
 $$;
 
 step do_changes: 
+	-- Insert one row into each partition.
 	INSERT INTO tbl_src VALUES (2, 20), (3, 30), (5, 50);
 
 	-- Update with no identity change.
 	UPDATE tbl_src SET j=0 WHERE i=1;
 
-	-- Update with identity change.
-	UPDATE tbl_src SET i=6 WHERE i=4;
+	-- Update with identity change but within the same partition.
+	UPDATE tbl_src SET i=6 WHERE i=5;
 
-	-- Update a row we inserted, to check that the insertion is visible.
-	UPDATE tbl_src SET j=7 WHERE i=2;
-	-- ... and update it again, to check that the update is visible.
-	UPDATE tbl_src SET j=8 WHERE j=7;
+	-- Cross-partition update.
+	UPDATE tbl_src SET i=7 WHERE i=3;
+
+	-- Update a row we inserted and updated, to check that it's visible.
+	UPDATE tbl_src SET j=4 WHERE i=7;
 
 	-- Delete.
-	DELETE FROM tbl_src WHERE i=7;
+	DELETE FROM tbl_src WHERE i=4;
 
 step wakeup_before_lock_ip: 
     SELECT injection_points_wakeup('pg_rewrite-before-lock');
@@ -75,7 +77,7 @@ BEGIN
 		PERFORM pg_sleep(.1);
 	END LOOP;
 END;
-$$;
+$$
 
 step do_check: 
     TABLE pg_rewrite_progress;
@@ -84,17 +86,16 @@ step do_check:
 
 src_table|dst_table|src_table_new|ins_initial|ins|upd|del
 ---------+---------+-------------+-----------+---+---+---
-tbl_src  |tbl_dst  |tbl_src_old  |          3|  3|  4|  1
+tbl_src  |tbl_dst  |tbl_src_old  |          2|  4|  3|  2
 (1 row)
 
 i| j
 -+--
 1| 0
-2| 8
-3|30
-5|50
-6|40
-(5 rows)
+2|20
+6|50
+7| 4
+(4 rows)
 
 step wakeup_after_commit_ip: 
     SELECT injection_points_wakeup('pg_rewrite-after-commit');

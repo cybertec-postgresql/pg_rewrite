@@ -103,7 +103,7 @@ static void run_worker(BackgroundWorker *worker, WorkerTask *task,
 					   bool nowait);
 
 static void check_prerequisites(Relation rel);
-static LogicalDecodingContext *setup_decoding(Oid relid, TupleDesc tup_desc);
+static LogicalDecodingContext *setup_decoding(Oid relid);
 static void decoding_cleanup(LogicalDecodingContext *ctx);
 static CatalogState *get_catalog_state(Oid relid);
 static void get_pg_class_info(Oid relid, TransactionId *xmin,
@@ -736,6 +736,13 @@ rewrite_worker_main(Datum main_arg)
 		MemoryContext old_context = CurrentMemoryContext;
 		ErrorData	*edata;
 
+		/*
+		 * If the backend is not waiting for our exit, make sure the error is
+		 * logged.
+		 */
+		if (MyWorkerTask->nowait)
+			PG_RE_THROW();
+
 		HOLD_INTERRUPTS();
 
 		/*
@@ -846,7 +853,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	LogicalDecodingContext *ctx;
 	ReplicationSlot *slot;
 	Snapshot	snap_hist;
-	TupleDesc	tup_desc_src;
 	CatalogState *cat_state;
 	XLogRecPtr	end_of_wal;
 	XLogRecPtr	xlog_insert_ptr;
@@ -907,14 +913,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	relid_src = RelationGetRelid(rel_src);
 
 	/*
-	 * Info to initialize the tuplestore we'll use during logical decoding.
-	 *
-	 * Copy is needed because we'll close the relation before using the tuple
-	 * descriptor.
-	 */
-	tup_desc_src = CreateTupleDescCopy(RelationGetDescr(rel_src));
-
-	/*
 	 * Get ready for the subsequent calls of
 	 * pg_rewrite_check_catalog_changes().
 	 *
@@ -959,7 +957,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	for (i = 0; i < nindexes; i++)
 		indexes_src[i] = cat_state->indexes[i].oid;
 
-	ctx = setup_decoding(relid_src, tup_desc_src);
+	ctx = setup_decoding(relid_src);
 
 	/*
 	 * The destination table should not be accessed by anyone during our
@@ -969,7 +967,8 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 * until the processing is done.
 	 *
 	 * This cannot be done before the call of setup_decoding() as the
-	 * exclusive lock does assign XID.
+	 * exclusive lock does assign XID. (setup_decoding() would then wait for
+	 * our transaction to complete.)
 	 */
 	relrv = makeRangeVar(relschema_dst, relname_dst, -1);
 	rel_dst = table_openrv(relrv, AccessExclusiveLock);
@@ -983,6 +982,12 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a permanent table", relname_dst)));
+
+	/*
+	 * Now that we have locked rel_dst, get its tuple descriptor.
+	 */
+	((DecodingOutputState *) ctx->output_writer_private)->tupdesc =
+		RelationGetDescr(rel_dst);
 
 	/*
 	 * Build a "historic snapshot", i.e. one that reflect the table state at
@@ -1527,7 +1532,7 @@ check_prerequisites(Relation rel)
  * and FATAL should lead to cleanup even before the cluster goes down.)
  */
 static LogicalDecodingContext *
-setup_decoding(Oid relid, TupleDesc tup_desc)
+setup_decoding(Oid relid)
 {
 	StringInfo	buf;
 	LogicalDecodingContext *ctx;
@@ -1598,7 +1603,6 @@ setup_decoding(Oid relid, TupleDesc tup_desc)
 	dstate->relid = relid;
 	dstate->tstore = tuplestore_begin_heap(false, false,
 										   maintenance_work_mem);
-	dstate->tupdesc = tup_desc;
 
 	/* Initialize the descriptor to store the changes ... */
 	dstate->tupdesc_change = CreateTemplateTupleDesc(1);
@@ -1626,7 +1630,6 @@ decoding_cleanup(LogicalDecodingContext *ctx)
 
 	ExecDropSingleTupleTableSlot(dstate->tsslot);
 	FreeTupleDesc(dstate->tupdesc_change);
-	FreeTupleDesc(dstate->tupdesc);
 	tuplestore_end(dstate->tstore);
 
 	FreeDecodingContext(ctx);
@@ -2104,6 +2107,7 @@ get_modify_table_state(EState *estate, Relation rel, CmdType operation)
 	ResultRelInfo *rri = makeNode(ResultRelInfo);
 
 	InitResultRelInfo(rri, rel, 0, NULL, 0);
+	ExecOpenIndices(rri, false);
 
 	result->ps.plan = NULL;
 	result->ps.state = estate;
@@ -2119,6 +2123,7 @@ get_modify_table_state(EState *estate, Relation rel, CmdType operation)
 static void
 free_modify_table_state(ModifyTableState *mtstate)
 {
+	ExecCloseIndices(mtstate->resultRelInfo);
 	pfree(mtstate->resultRelInfo);
 	pfree(mtstate);
 }
