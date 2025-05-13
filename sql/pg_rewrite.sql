@@ -10,11 +10,6 @@ INSERT INTO tab1(i, j, k)
 SELECT i, i / 2, i
 FROM generate_series(0, 1023) g(i);
 
--- Backup the source table.
-CREATE TABLE tab1_bkp (LIKE tab1 INCLUDING ALL);
-INSERT INTO tab1_bkp(i, j, k)
-SELECT i, j, k FROM tab1;
-
 CREATE TABLE tab1_new(i int PRIMARY KEY, j int, k int) PARTITION BY RANGE(i);
 CREATE TABLE tab1_new_part_1 PARTITION OF tab1_new FOR VALUES FROM (0) TO (256);
 CREATE TABLE tab1_new_part_2 PARTITION OF tab1_new FOR VALUES FROM (256) TO (512);
@@ -31,7 +26,7 @@ EXPLAIN SELECT * FROM tab1;
 SELECT count(*) FROM tab1;
 
 SELECT *
-FROM tab1 t FULL JOIN tab1_bkp o ON t.i = o.i
+FROM tab1 t FULL JOIN tab1_orig o ON t.i = o.i
 WHERE t.i ISNULL OR o.i ISNULL;
 
 -- List partitioning
