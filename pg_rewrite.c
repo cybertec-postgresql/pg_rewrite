@@ -86,7 +86,6 @@ static partitions_hash *get_partitions(Relation rel_src, Relation rel_dst,
 									   Relation **parts_dst_p,
 									   ScanKey *ident_key_p,
 									   int *ident_key_nentries);
-static int	index_cat_info_compare(const void *arg1, const void *arg2);
 
 /* The WAL segment being decoded. */
 XLogSegNo	rewrite_current_segment = 0;
@@ -105,28 +104,11 @@ static void run_worker(BackgroundWorker *worker, WorkerTask *task,
 					   bool nowait);
 
 static void check_prerequisites(Relation rel);
-static LogicalDecodingContext *setup_decoding(Oid relid);
+static LogicalDecodingContext *setup_decoding(Relation rel);
 static void decoding_cleanup(LogicalDecodingContext *ctx);
-static CatalogState *get_catalog_state(Oid relid);
-static void get_pg_class_info(Oid relid, TransactionId *xmin,
-							  Form_pg_class *form_p, TupleDesc *desc_p);
-static void get_attribute_info(Oid relid, int relnatts,
-							   TransactionId **xmins_p,
-							   CatalogState *cat_state);
-static void cache_composite_type_info(CatalogState *cat_state, Oid typid);
-static void get_composite_type_info(TypeCatInfo *tinfo);
-static IndexCatInfo *get_index_info(Oid relid, int *relninds,
-									bool *found_invalid,
-									bool invalid_check_only,
-									bool *found_pk);
 static ModifyTableState *get_modify_table_state(EState *estate, Relation rel,
 												CmdType operation);
 static void free_modify_table_state(ModifyTableState *mtstate);
-static void check_attribute_changes(CatalogState *cat_state);
-static void check_index_changes(CatalogState *state);
-static void check_composite_type_changes(CatalogState *cat_state);
-static void free_catalog_state(CatalogState *state);
-static void check_pg_class_changes(CatalogState *state);
 static Snapshot build_historic_snapshot(SnapBuild *builder);
 static void perform_initial_load(EState *estate, ModifyTableState *mtstate,
 								 struct PartitionTupleRouting *proute,
@@ -139,12 +121,11 @@ static ScanKey build_identity_key(Relation ident_idx_rel, int *nentries);
 static bool perform_final_merge(EState *estate,
 								ModifyTableState *mtstate,
 								struct PartitionTupleRouting *proute,
-								Oid relid_src, Oid *indexes_src, int nindexes,
+								Relation rel_src,
 								ScanKey ident_key,
 								int ident_key_nentries,
 								Relation ident_index,
 								TupleTableSlot *slot_dst_ind,
-								CatalogState *cat_state,
 								LogicalDecodingContext *ctx,
 								partitions_hash *ident_indexes,
 								TupleConversionMapExt *conv_map);
@@ -868,13 +849,8 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	LogicalDecodingContext *ctx;
 	ReplicationSlot *slot;
 	Snapshot	snap_hist;
-	CatalogState *cat_state;
 	XLogRecPtr	end_of_wal;
 	XLogRecPtr	xlog_insert_ptr;
-	int			nindexes;
-	Oid		   *indexes_src = NULL;
-	bool		invalid_index = false;
-	IndexCatInfo *ind_info;
 	bool		source_finalized;
 	Relation   *parts_dst = NULL;
 	int		nparts;
@@ -884,8 +860,13 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	ModifyTableState *mtstate;
 	struct PartitionTupleRouting *proute = NULL;
 
+	/*
+	 * Use ShareUpdateExclusiveLock as it allows DML commands but does block
+	 * most of DDLs (including CREATE INDEX).
+	 */
 	relrv = makeRangeVar(relschema_src, relname_src, -1);
-	rel_src = table_openrv(relrv, AccessShareLock);
+	rel_src = table_openrv(relrv, ShareUpdateExclusiveLock);
+	relid_src = RelationGetRelid(rel_src);
 
 	check_prerequisites(rel_src);
 
@@ -901,9 +882,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	/*
 	 * Check if we're ready to capture changes that possibly take place during
 	 * the initial load.
-	 *
-	 * Concurrent DDL causes ERROR in any case, so don't worry about validity
-	 * of this test during the next steps.
 	 *
 	 * Note: we let the plugin do this check on per-change basis, and allow
 	 * processing of tables with no identity if only INSERT changes are
@@ -925,63 +903,15 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 				 (errmsg("Table \"%s\" has no identity index",
 						 relname_src))));
 
-	relid_src = RelationGetRelid(rel_src);
+	/* Prepare for decoding of "concurrent data changes". */
+	ctx = setup_decoding(rel_src);
 
 	/*
-	 * Get ready for the subsequent calls of
-	 * pg_rewrite_check_catalog_changes().
+	 * No one should need to access the destination table during our
+	 * processing. We will eventually need AccessExclusiveLock for renaming,
+	 * so acquire it right away.
 	 *
-	 * Not all index changes do conflict with the AccessShareLock - see
-	 * get_index_info() for explanation.
-	 *
-	 * XXX It'd still be correct to start the check a bit later, i.e. just
-	 * before CreateInitDecodingContext(), but the gain is not worth making
-	 * the code less readable.
-	 */
-	cat_state = get_catalog_state(relid_src);
-
-	/* Give up if it's clear enough to do so. */
-	if (cat_state->invalid_index)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 (errmsg("At least one index is invalid"))));
-
-	/*
-	 * The relation shouldn't be locked during the call of setup_decoding(),
-	 * otherwise another transaction could write XLOG records before the
-	 * slots' data.restart_lsn and we'd have to wait for it to finish. If such
-	 * a transaction requested exclusive lock on our relation (e.g. ALTER
-	 * TABLE), it'd result in a deadlock.
-	 *
-	 * We can't keep the lock till the end of transaction anyway - that's why
-	 * pg_rewrite_check_catalog_changes() exists.
-	 */
-	table_close(rel_src, AccessShareLock);
-
-	nindexes = cat_state->relninds;
-
-	/*
-	 * Existence of identity index was checked above, so number of indexes and
-	 * attributes are both non-zero.
-	 */
-	Assert(cat_state->form_class->relnatts >= 1);
-	Assert(nindexes > 0);
-
-	/* Copy the OIDs into a separate array, for convenient use later. */
-	indexes_src = (Oid *) palloc(nindexes * sizeof(Oid));
-	for (i = 0; i < nindexes; i++)
-		indexes_src[i] = cat_state->indexes[i].oid;
-
-	ctx = setup_decoding(relid_src);
-
-	/*
-	 * The destination table should not be accessed by anyone during our
-	 * processing. We're especially worried about DDLs because those might
-	 * make us crash during data insertion. So lock the table in exclusive
-	 * mode. Thus the checks for catalog changes we perform below stay valid
-	 * until the processing is done.
-	 *
-	 * This cannot be done before the call of setup_decoding() as the
+	 * This should not be done before the call of setup_decoding() as the
 	 * exclusive lock does assign XID. (setup_decoding() would then wait for
 	 * our transaction to complete.)
 	 */
@@ -1005,28 +935,12 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	snap_hist = build_historic_snapshot(ctx->snapshot_builder);
 
-	/* The source relation will be needed for the initial load. */
-	rel_src = table_open(relid_src, AccessShareLock);
-
-	/*
-	 * Now that we have opened rel_src, get its tuple descriptor.
-	 *
-	 * Copy is needed because we'll close the relation before using the tuple
-	 * descriptor.
-	 */
-	((DecodingOutputState *) ctx->output_writer_private)->tupdesc_src =
-		CreateTupleDescCopy(RelationGetDescr(rel_src));
-
 	/*
 	 * Create a conversion map so that we can handle difference(s) in the
 	 * tuple descriptor. Note that a copy is passed to 'indesc' since the map
 	 * contains a tuple slot based on this descriptor and since 'rel_src' will
 	 * be closed and re-opened (in order to acquire AccessExclusiveLock)
 	 * before the last use of 'conv_map'.
-	 */
-	/*
-	 * TODO Say in documentation that the destination table must have the same
-	 * constraints as the source. (Also explain how to treat FK constraints.)
 	 */
 	conv_map = convert_tuples_by_name_ext(CreateTupleDescCopy(RelationGetDescr(rel_src)),
 										  RelationGetDescr(rel_dst));
@@ -1045,17 +959,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	}
 
 	Assert(ident_key_nentries > 0);
-
-	/*
-	 * We need to know whether no DDL took place that allows for data
-	 * inconsistency. The source relation was unlocked for some time since
-	 * last check, so pass NoLock.
-	 *
-	 * The destination relation needs no check because we've locked it in
-	 * exclusive mode at the beginning and will not release the lock until
-	 * we're done.
-	 */
-	pg_rewrite_check_catalog_changes(cat_state, NoLock);
 
 	/* Executor state to determine the target partition. */
 	estate = CreateExecutorState();
@@ -1111,21 +1014,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	CommandCounterIncrement();
 
-	/*
-	 * As we'll need to take exclusive lock later, release the shared one.
-	 *
-	 * Note: PG core code shouldn't actually participate in such a deadlock,
-	 * as it (supposedly) does not raise lock level. Nor should concurrent
-	 * call of the partition_table() function participate in the deadlock,
-	 * because it should have failed much earlier when creating an existing
-	 * logical replication slot again. Nevertheless, these circumstances still
-	 * don't justify generally bad practice.
-	 *
-	 * (As we haven't changed the catalog entry yet, there's no need to send
-	 * invalidation messages.)
-	 */
-	table_close(rel_src, AccessShareLock);
-
     /*
      * During testing, wait for another backend to perform concurrent data
      * changes which we will process below.
@@ -1165,7 +1053,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 										  proute,
 										  ctx,
 										  end_of_wal,
-										  cat_state,
 										  ident_key,
 										  ident_key_nentries,
 										  ident_index,
@@ -1174,26 +1061,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 										  partitions,
 										  conv_map,
 										  NULL);
-
-	/*
-	 * This (supposedly cheap) special check should avoid one particular
-	 * deadlock scenario: another transaction, performing index DDL
-	 * concurrenly (e.g. DROP INDEX CONCURRENTLY) committed change of
-	 * indisvalid, indisready, ... and called WaitForLockers() before we
-	 * unlocked both source table and its indexes above. WaitForLockers()
-	 * waits till the end of the holding (our) transaction as opposed to the
-	 * end of our locks, and the other transaction holds (non-exclusive) lock
-	 * on both relation and index. In this situation we'd cause deadlock by
-	 * requesting exclusive lock. We should recognize this scenario by
-	 * checking pg_index alone.
-	 */
-	ind_info = get_index_info(relid_src, NULL, &invalid_index, true, NULL);
-	if (invalid_index)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("Concurrent change of index detected")));
-	else
-		pfree(ind_info);
 
 	/*
 	 * Try a few times to perform the stage that requires exclusive lock on
@@ -1207,23 +1074,25 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	for (i = 0; i < 4; i++)
 	{
 		if (perform_final_merge(estate, mtstate, proute,
-								relid_src, indexes_src, nindexes,
-								ident_key, ident_key_nentries,
+								rel_src, ident_key, ident_key_nentries,
 								ident_index, slot_dst_ind,
-								cat_state, ctx, partitions, conv_map))
+								ctx, partitions, conv_map))
 		{
 			source_finalized = true;
 			break;
 		}
 		else
 			elog(DEBUG1,
-				 "pg_rewrite exclusive lock on table %u had to be released.",
+				 "pg_rewrite: exclusive lock on table %u had to be released.",
 				 relid_src);
 	}
 	if (!source_finalized)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("pg_rewrite: \"max_xlock_time\" prevented partitioning from completion")));
+
+	/* rel_src cache entry is not needed anymore, but the lock is. */
+	table_close(rel_src, NoLock);
 
 	/*
 	 * Done with decoding.
@@ -1321,12 +1190,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 		index_close(ident_index, AccessShareLock);
 		ExecDropSingleTupleTableSlot(slot_dst_ind);
 	}
-
-	if (nindexes > 0)
-		pfree(indexes_src);
-
-	/* State not needed anymore. */
-	free_catalog_state(cat_state);
 
 	free_modify_table_state(mtstate);
 	FreeExecutorState(estate);
@@ -1495,20 +1358,6 @@ get_partitions(Relation rel_src, Relation rel_dst, int *nparts,
 	return partitions;
 }
 
-static int
-index_cat_info_compare(const void *arg1, const void *arg2)
-{
-	IndexCatInfo *i1 = (IndexCatInfo *) arg1;
-	IndexCatInfo *i2 = (IndexCatInfo *) arg2;
-
-	if (i1->oid > i2->oid)
-		return 1;
-	else if (i1->oid < i2->oid)
-		return -1;
-	else
-		return 0;
-}
-
 /*
  * Raise error if the relation is not eligible for partitioning or any adverse
  * conditions exist.
@@ -1590,8 +1439,9 @@ check_prerequisites(Relation rel)
  * and FATAL should lead to cleanup even before the cluster goes down.)
  */
 static LogicalDecodingContext *
-setup_decoding(Oid relid)
+setup_decoding(Relation rel)
 {
+	Oid	relid = RelationGetRelid(rel);
 	StringInfo	buf;
 	LogicalDecodingContext *ctx;
 	DecodingOutputState *dstate;
@@ -1673,6 +1523,14 @@ setup_decoding(Oid relid)
 	dstate->resowner = ResourceOwnerCreate(CurrentResourceOwner,
 										   "logical decoding");
 
+	/*
+	 * Tuple descriptor of the source relation might be needed for decoding.
+	 *
+	 * Copy is needed because we'll close the relation before using the tuple
+	 * descriptor.
+	 */
+	dstate->tupdesc_src = CreateTupleDescCopy(RelationGetDescr(rel));
+
 	MemoryContextSwitchTo(oldcontext);
 
 	ctx->output_writer_private = dstate;
@@ -1692,467 +1550,6 @@ decoding_cleanup(LogicalDecodingContext *ctx)
 	tuplestore_end(dstate->tstore);
 
 	FreeDecodingContext(ctx);
-}
-
-/*
- * Retrieve the catalog state to be passed later to
- * pg_rewrite_check_catalog_changes.
- *
- * Caller is supposed to hold (at least) AccessShareLock on the relation.
- */
-static CatalogState *
-get_catalog_state(Oid relid)
-{
-	CatalogState *result;
-
-	result = (CatalogState *) palloc0(sizeof(CatalogState));
-	result->rel.relid = relid;
-
-	/*
-	 * pg_class(xmin) helps to ensure that the "user_catalog_option" wasn't
-	 * turned off and on. On the other hand it might restrict some concurrent
-	 * DDLs that would be safe as such.
-	 */
-	get_pg_class_info(relid, &result->rel.xmin, &result->form_class,
-					  &result->desc_class);
-
-	result->rel.relnatts = result->form_class->relnatts;
-
-	/*
-	 * We might want to avoid the check if relhasindex is false, but
-	 * index_update_stats() updates this field in-place. (Currently it should
-	 * not change from "true" to "false", but let's be cautious anyway.)
-	 */
-	result->indexes = get_index_info(relid, &result->relninds,
-									 &result->invalid_index, false,
-									 &result->have_pk_index);
-
-	/* If any index is "invalid", no more catalog information is needed. */
-	if (result->invalid_index)
-		return result;
-
-	if (result->form_class->relnatts > 0)
-		get_attribute_info(relid, result->form_class->relnatts,
-						   &result->rel.attr_xmins, result);
-
-	return result;
-}
-
-/*
- * For given relid retrieve pg_class(xmin). Also set *form and *desc if valid
- * pointers are passed.
- */
-static void
-get_pg_class_info(Oid relid, TransactionId *xmin, Form_pg_class *form_p,
-				  TupleDesc *desc_p)
-{
-	HeapTuple	tuple;
-	Form_pg_class form_class;
-	Relation	rel;
-	SysScanDesc scan;
-	ScanKeyData key[1];
-
-	/*
-	 * ScanPgRelation() would do most of the work below, but relcache.c does
-	 * not export it.
-	 */
-	rel = table_open(RelationRelationId, AccessShareLock);
-
-	ScanKeyInit(&key[0],
-				Anum_pg_class_oid,
-				BTEqualStrategyNumber,
-				F_OIDEQ,
-				ObjectIdGetDatum(relid));
-	scan = systable_beginscan(rel, ClassOidIndexId, true, NULL, 1, key);
-	tuple = systable_getnext(scan);
-
-	/*
-	 * As the relation might not be locked by some callers, it could have
-	 * disappeared.
-	 */
-	if (!HeapTupleIsValid(tuple))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_TABLE),
-				 (errmsg("Table no longer exists"))));
-	}
-
-	/* Invalid relfilenode indicates mapped relation. */
-	form_class = (Form_pg_class) GETSTRUCT(tuple);
-	if (form_class->relfilenode == InvalidOid)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 (errmsg("Mapped relation cannot be partitioned"))));
-
-	*xmin = HeapTupleHeaderGetXmin(tuple->t_data);
-
-	if (form_p)
-	{
-		*form_p = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
-		memcpy(*form_p, form_class, CLASS_TUPLE_SIZE);
-	}
-
-	if (desc_p)
-		*desc_p = CreateTupleDescCopy(RelationGetDescr(rel));
-
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-}
-
-/*
- * Retrieve array of pg_attribute(xmin) values for given relation, ordered by
- * attnum. (The ordering is not essential but lets us do some extra sanity
- * checks.)
- *
- * If cat_state is passed and the attribute is of a composite type, make sure
- * it's cached in ->comptypes.
- */
-static void
-get_attribute_info(Oid relid, int relnatts, TransactionId **xmins_p,
-				   CatalogState *cat_state)
-{
-	Relation	rel;
-	ScanKeyData key[2];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	TransactionId *result;
-	int			n = 0;
-
-	rel = table_open(AttributeRelationId, AccessShareLock);
-
-	ScanKeyInit(&key[0], Anum_pg_attribute_attrelid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(relid));
-	/* System columns should not be ALTERed. */
-	ScanKeyInit(&key[1],
-				Anum_pg_attribute_attnum,
-				BTGreaterStrategyNumber, F_INT2GT,
-				Int16GetDatum(0));
-	scan = systable_beginscan(rel, AttributeRelidNumIndexId, true, NULL,
-							  2, key);
-	result = (TransactionId *) palloc(relnatts * sizeof(TransactionId));
-	while ((tuple = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_attribute form;
-		int			i;
-
-		Assert(HeapTupleIsValid(tuple));
-		form = (Form_pg_attribute) GETSTRUCT(tuple);
-		Assert(form->attnum > 0);
-
-		/* AttributeRelidNumIndexId index ensures ordering. */
-		i = form->attnum - 1;
-		Assert(i == n);
-
-		/*
-		 * Caller should hold at least AccesShareLock on the owning relation,
-		 * supposedly no need for repalloc(). (elog() rather than Assert() as
-		 * it's not difficult to break this assumption during future coding.)
-		 */
-		if (n++ > relnatts)
-			elog(ERROR, "Relation %u has too many attributes", relid);
-
-		result[i] = HeapTupleHeaderGetXmin(tuple->t_data);
-
-		/*
-		 * Gather composite type info if needed.
-		 */
-		if (cat_state != NULL &&
-			get_typtype(form->atttypid) == TYPTYPE_COMPOSITE)
-			cache_composite_type_info(cat_state, form->atttypid);
-	}
-	Assert(relnatts == n);
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-	*xmins_p = result;
-}
-
-
-/*
- * Make sure that information on a type that caller has recognized as
- * composite type is cached in cat_state.
- */
-static void
-cache_composite_type_info(CatalogState *cat_state, Oid typid)
-{
-	int			i;
-	bool		found = false;
-	TypeCatInfo *tinfo;
-
-	/* Check if we already have this type. */
-	for (i = 0; i < cat_state->ncomptypes; i++)
-	{
-		tinfo = &cat_state->comptypes[i];
-
-		if (tinfo->oid == typid)
-		{
-			found = true;
-			break;
-		}
-	}
-
-	if (found)
-		return;
-
-	/* Extend the comptypes array if necessary. */
-	if (cat_state->ncomptypes == cat_state->ncomptypes_max)
-	{
-		if (cat_state->ncomptypes_max == 0)
-		{
-			Assert(cat_state->comptypes == NULL);
-			cat_state->ncomptypes_max = 2;
-			cat_state->comptypes = (TypeCatInfo *)
-				palloc(cat_state->ncomptypes_max * sizeof(TypeCatInfo));
-		}
-		else
-		{
-			cat_state->ncomptypes_max *= 2;
-			cat_state->comptypes = (TypeCatInfo *)
-				repalloc(cat_state->comptypes,
-						 cat_state->ncomptypes_max * sizeof(TypeCatInfo));
-		}
-	}
-
-	tinfo = &cat_state->comptypes[cat_state->ncomptypes];
-	tinfo->oid = typid;
-	get_composite_type_info(tinfo);
-
-	cat_state->ncomptypes++;
-}
-
-/*
- * Retrieve information on a type that caller has recognized as composite
- * type. tinfo->oid must be initialized.
- */
-static void
-get_composite_type_info(TypeCatInfo *tinfo)
-{
-	Relation	rel;
-	ScanKeyData key[1];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	Form_pg_type form_type;
-	Form_pg_class form_class;
-
-	Assert(tinfo->oid != InvalidOid);
-
-	/* Find the pg_type tuple. */
-	rel = table_open(TypeRelationId, AccessShareLock);
-
-	ScanKeyInit(&key[0],
-				Anum_pg_type_oid,
-				BTEqualStrategyNumber,
-				F_OIDEQ,
-				ObjectIdGetDatum(tinfo->oid));
-	scan = systable_beginscan(rel, TypeOidIndexId, true, NULL, 1, key);
-	tuple = systable_getnext(scan);
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "composite type %u not found", tinfo->oid);
-
-	form_type = (Form_pg_type) GETSTRUCT(tuple);
-	Assert(form_type->typtype == TYPTYPE_COMPOSITE);
-
-	/* Initialize the structure. */
-	tinfo->xmin = HeapTupleHeaderGetXmin(tuple->t_data);
-
-	/*
-	 * Retrieve the pg_class tuple that represents the composite type, as well
-	 * as the corresponding pg_attribute tuples.
-	 */
-	tinfo->rel.relid = form_type->typrelid;
-	get_pg_class_info(form_type->typrelid, &tinfo->rel.xmin, &form_class,
-					  NULL);
-	if (form_class->relnatts > 0)
-		get_attribute_info(form_type->typrelid, form_class->relnatts,
-						   &tinfo->rel.attr_xmins, NULL);
-	else
-		tinfo->rel.attr_xmins = NULL;
-	tinfo->rel.relnatts = form_class->relnatts;
-
-	pfree(form_class);
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-}
-
-/*
- * Retrieve pg_class(oid) and pg_class(xmin) for each index of given
- * relation.
- *
- * If at least one index appears to be problematic in terms of concurrency,
- * *found_invalid receives true and retrieval of index information ends
- * immediately.
- *
- * If invalid_check_only is true, return after having verified that all
- * indexes are valid.
- *
- * Note that some index DDLs can commit while this function is called from
- * get_catalog_state(). If we manage to see these changes, our result includes
- * them and they'll affect the destination table. If any such change gets
- * committed later and we miss it, it'll be identified as disruptive by
- * pg_rewrite_check_catalog_changes(). After all, there should be no dangerous
- * race conditions.
- */
-static IndexCatInfo *
-get_index_info(Oid relid, int *relninds, bool *found_invalid,
-			   bool invalid_check_only, bool *found_pk)
-{
-	Relation	rel,
-				rel_idx;
-	ScanKeyData key[1];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	IndexCatInfo *result;
-	int			i,
-				n = 0;
-	int			relninds_max = 4;
-	Datum	   *oids_d;
-	int16		oidlen;
-	bool		oidbyval;
-	char		oidalign;
-	ArrayType  *oids_a;
-	bool		mismatch;
-
-	*found_invalid = false;
-	if (found_pk)
-		*found_pk = false;
-
-	/*
-	 * Open both pg_class and pg_index catalogs at once, so that we have a
-	 * consistent view in terms of invalidation. Otherwise we might get
-	 * different snapshot for each. Thus, in-progress index changes that do
-	 * not conflict with AccessShareLock on the parent table could trigger
-	 * false alarms later in pg_rewrite_check_catalog_changes().
-	 */
-	rel = table_open(RelationRelationId, AccessShareLock);
-	rel_idx = table_open(IndexRelationId, AccessShareLock);
-
-	ScanKeyInit(&key[0], Anum_pg_index_indrelid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(relid));
-	scan = systable_beginscan(rel_idx, IndexIndrelidIndexId, true, NULL, 1,
-							  key);
-
-	result = (IndexCatInfo *) palloc(relninds_max * sizeof(IndexCatInfo));
-	while ((tuple = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_index form;
-		IndexCatInfo *res_entry;
-
-		form = (Form_pg_index) GETSTRUCT(tuple);
-
-		/*
-		 * First, perform the simple checks that can make the next work
-		 * unnecessary.
-		 */
-		if (!form->indisvalid || !form->indisready || !form->indislive)
-		{
-			*found_invalid = true;
-			break;
-		}
-
-		res_entry = (IndexCatInfo *) &result[n++];
-		res_entry->oid = form->indexrelid;
-		res_entry->xmin = HeapTupleHeaderGetXmin(tuple->t_data);
-		if (found_pk && form->indisprimary)
-			*found_pk = true;
-
-		/*
-		 * Unlike get_attribute_info(), we can't receive the expected number
-		 * of entries from caller.
-		 */
-		if (n == relninds_max)
-		{
-			relninds_max *= 2;
-			result = (IndexCatInfo *)
-				repalloc(result, relninds_max * sizeof(IndexCatInfo));
-		}
-	}
-	systable_endscan(scan);
-	table_close(rel_idx, AccessShareLock);
-
-	/* Return if invalid index was found or ... */
-	if (*found_invalid)
-	{
-		table_close(rel, AccessShareLock);
-		return result;
-	}
-	/* ... caller is not interested in anything else.  */
-	if (invalid_check_only)
-	{
-		table_close(rel, AccessShareLock);
-		return result;
-	}
-
-	/*
-	 * Enforce sorting by OID, so that the entries match the result of the
-	 * following scan using OID index.
-	 */
-	qsort(result, n, sizeof(IndexCatInfo), index_cat_info_compare);
-
-	if (relninds)
-		*relninds = n;
-	if (n == 0)
-	{
-		table_close(rel, AccessShareLock);
-		return result;
-	}
-
-	/*
-	 * Now retrieve the corresponding pg_class(xmax) values.
-	 *
-	 * Here it seems reasonable to construct an array of OIDs of the pg_class
-	 * entries of the indexes and use amsearcharray function of the index.
-	 */
-	oids_d = (Datum *) palloc(n * sizeof(Datum));
-	for (i = 0; i < n; i++)
-		oids_d[i] = ObjectIdGetDatum(result[i].oid);
-	get_typlenbyvalalign(OIDOID, &oidlen, &oidbyval, &oidalign);
-	oids_a = construct_array(oids_d, n, OIDOID, oidlen, oidbyval, oidalign);
-	pfree(oids_d);
-
-	ScanKeyInit(&key[0],
-				Anum_pg_class_oid,
-				BTEqualStrategyNumber,
-				F_OIDEQ,
-				PointerGetDatum(oids_a));
-	key[0].sk_flags |= SK_SEARCHARRAY;
-	scan = systable_beginscan(rel, ClassOidIndexId, true, NULL, 1, key);
-	i = 0;
-	mismatch = false;
-	while ((tuple = systable_getnext(scan)) != NULL)
-	{
-		IndexCatInfo *res_item;
-		Form_pg_class form_class;
-		char	   *namestr;
-
-		if (i == n)
-		{
-			/* Index added concurrently? */
-			mismatch = true;
-			break;
-		}
-		res_item = &result[i++];
-		res_item->pg_class_xmin = HeapTupleHeaderGetXmin(tuple->t_data);
-		form_class = (Form_pg_class) GETSTRUCT(tuple);
-		namestr = NameStr(form_class->relname);
-		Assert(strlen(namestr) < NAMEDATALEN);
-		strcpy(NameStr(res_item->relname), namestr);
-
-		res_item->reltablespace = form_class->reltablespace;
-	}
-	if (i < n)
-		mismatch = true;
-
-	if (mismatch)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("Concurrent change of index detected")));
-
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-	pfree(oids_a);
-
-	return result;
 }
 
 /*
@@ -2185,295 +1582,6 @@ free_modify_table_state(ModifyTableState *mtstate)
 	ExecCloseIndices(mtstate->resultRelInfo);
 	pfree(mtstate->resultRelInfo);
 	pfree(mtstate);
-}
-
-/*
- * Compare the passed catalog information to the info retrieved using the most
- * recent catalog snapshot. Perform the cheapest checks first, the trickier
- * ones later.
- *
- * lock_held is the *least* mode of the lock held by caller on stat->relid
- * relation since the last check. This information helps to avoid unnecessary
- * checks.
- *
- * We check neither constraint nor trigger related DDLs, those are checked by
- * compare_constraints().
- *
- * Unlike get_catalog_state(), fresh catalog snapshot is used for each catalog
- * scan. That might increase the chance a little bit that concurrent change
- * will be detected in the current call, instead of the following one.
- *
- * (As long as we use xmin columns of the catalog tables to detect changes, we
- * can't use syscache here.)
- *
- * XXX It's worth checking AlterTableGetLockLevel() each time we adopt a new
- * version of PG core.
- *
- * XXX Do we still need everything this function does? Unlike pg_squeeze,
- * where we only deal with a single table, various catalog entries need to be
- * compared between the source and the destination table. Since the
- * destination table is locked exclusively all the time (i.e. its catalog
- * entries should not change), catalog changes on the source side should be
- * detected by comparing the source and destination relation again.
- */
-void
-pg_rewrite_check_catalog_changes(CatalogState *state, LOCKMODE lock_held)
-{
-	/*
-	 * No DDL should be compatible with this lock mode. (Not sure if this
-	 * condition will ever fire.)
-	 */
-	if (lock_held == AccessExclusiveLock)
-		return;
-
-	/*
-	 * First the source relation itself.
-	 *
-	 * Only AccessExclusiveLock guarantees that the pg_class entry hasn't
-	 * changed. By lowering this threshold we'd perhaps skip unnecessary check
-	 * sometimes (e.g. change of pg_class(relhastriggers) is unimportant), but
-	 * we could also miss the check when necessary. It's simply too fragile to
-	 * deduce the kind of DDL from lock level, so do this check
-	 * unconditionally.
-	 */
-	check_pg_class_changes(state);
-
-	/*
-	 * Index change does not necessarily require lock of the parent relation,
-	 * so check indexes unconditionally.
-	 */
-	check_index_changes(state);
-
-	/*
-	 * XXX If any lock level lower than AccessExclusiveLock conflicts with all
-	 * commands that change pg_attribute catalog, skip this check if lock_held
-	 * is at least that level.
-	 */
-	check_attribute_changes(state);
-
-	/*
-	 * Finally check if any composite type used by the source relation has
-	 * changed.
-	 */
-	if (state->ncomptypes > 0)
-		check_composite_type_changes(state);
-}
-
-static void
-check_pg_class_changes(CatalogState *cat_state)
-{
-	TransactionId xmin_current;
-
-	get_pg_class_info(cat_state->rel.relid, &xmin_current, NULL, NULL);
-
-	/*
-	 * Check if pg_class(xmin) has changed.
-	 *
-	 * The changes caught here include change of pg_class(relfilenode), which
-	 * indicates heap rewriting or TRUNCATE command (or concurrent call of
-	 * partition_table(), but that should fail to allocate new replication
-	 * slot). (Invalid relfilenode does not change, but mapped relations are
-	 * excluded from processing by get_catalog_state().)
-	 */
-	if (!TransactionIdEquals(xmin_current, cat_state->rel.xmin))
-		/* XXX Does more suitable error code exist? */
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("Incompatible DDL or heap rewrite performed concurrently")));
-}
-
-/*
- * Check if any tuple of pg_attribute of given relation has changed. In
- * addition, if the attribute type is composite, check for its changes too.
- */
-static void
-check_attribute_changes(CatalogState *cat_state)
-{
-	TransactionId *attrs_new;
-	int			i;
-
-	/*
-	 * Since pg_class should have been checked by now, relnatts can only be
-	 * zero if it was zero originally, so there's no info to be compared to
-	 * the current state.
-	 */
-	if (cat_state->rel.relnatts == 0)
-	{
-		Assert(cat_state->rel.attr_xmins == NULL);
-		return;
-	}
-
-	/*
-	 * Check if any row of pg_attribute changed.
-	 *
-	 * If the underlying type is composite, pg_attribute(xmin) will not
-	 * reflect its change, so pass NULL for cat_state to indicate that we're
-	 * not interested in type info at the moment. We'll do that later if all
-	 * the cheaper tests pass.
-	 */
-	get_attribute_info(cat_state->rel.relid, cat_state->rel.relnatts,
-					   &attrs_new, NULL);
-	for (i = 0; i < cat_state->rel.relnatts; i++)
-	{
-		if (!TransactionIdEquals(cat_state->rel.attr_xmins[i], attrs_new[i]))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_IN_USE),
-					 errmsg("Table definition changed concurrently")));
-	}
-	pfree(attrs_new);
-}
-
-static void
-check_index_changes(CatalogState *cat_state)
-{
-	IndexCatInfo *inds_new;
-	int			relninds_new;
-	bool		failed = false;
-	bool		invalid_index;
-	bool		have_pk_index;
-
-	if (cat_state->relninds == 0)
-	{
-		Assert(cat_state->indexes == NULL);
-		return;
-	}
-
-	inds_new = get_index_info(cat_state->rel.relid, &relninds_new,
-							  &invalid_index, false, &have_pk_index);
-
-	/*
-	 * If this field was set to true, no attention was paid to the other
-	 * fields during catalog scans.
-	 */
-	if (invalid_index)
-		failed = true;
-
-	if (!failed && relninds_new != cat_state->relninds)
-		failed = true;
-
-	/*
-	 * It might be o.k. for the PK index to disappear if the table still has
-	 * an unique constraint, but this is too hard to check.
-	 */
-	if (!failed && cat_state->have_pk_index != have_pk_index)
-		failed = true;
-
-	if (!failed)
-	{
-		int			i;
-
-		for (i = 0; i < cat_state->relninds; i++)
-		{
-			IndexCatInfo *ind,
-					   *ind_new;
-
-			ind = &cat_state->indexes[i];
-			ind_new = &inds_new[i];
-			if (ind->oid != ind_new->oid ||
-				!TransactionIdEquals(ind->xmin, ind_new->xmin) ||
-				!TransactionIdEquals(ind->pg_class_xmin,
-									 ind_new->pg_class_xmin))
-			{
-				failed = true;
-				break;
-			}
-		}
-	}
-	if (failed)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("Concurrent change of index detected")));
-	pfree(inds_new);
-}
-
-static void
-check_composite_type_changes(CatalogState *cat_state)
-{
-	int			i;
-	TypeCatInfo *changed = NULL;
-
-	for (i = 0; i < cat_state->ncomptypes; i++)
-	{
-		TypeCatInfo *tinfo = &cat_state->comptypes[i];
-		TypeCatInfo tinfo_new;
-		int			j;
-
-		tinfo_new.oid = tinfo->oid;
-		get_composite_type_info(&tinfo_new);
-
-		if (!TransactionIdEquals(tinfo->xmin, tinfo_new.xmin) ||
-			!TransactionIdEquals(tinfo->rel.xmin, tinfo_new.rel.xmin) ||
-			(tinfo->rel.relnatts != tinfo_new.rel.relnatts))
-		{
-			changed = tinfo;
-			break;
-		}
-
-		/*
-		 * Check the individual attributes of the type relation.
-		 *
-		 * This should catch ALTER TYPE ... ALTER ATTRIBUTE ... change of
-		 * attribute data type, which is currently not allowed if the type is
-		 * referenced by any table. Do it yet in this generic way so that we
-		 * don't have to care whether any PG restrictions are relaxed in the
-		 * future.
-		 */
-		for (j = 0; j < tinfo->rel.relnatts; j++)
-		{
-			if (!TransactionIdEquals(tinfo->rel.attr_xmins[j],
-									 tinfo_new.rel.attr_xmins[j]))
-			{
-				changed = tinfo;
-				break;
-			}
-		}
-
-		if (tinfo_new.rel.relnatts > 0)
-		{
-			Assert(tinfo_new.rel.attr_xmins != NULL);
-			pfree(tinfo_new.rel.attr_xmins);
-		}
-
-		if (changed != NULL)
-			break;
-	}
-
-	if (changed != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("Concurrent change of composite type %u detected",
-						changed->oid)));
-}
-
-static void
-free_catalog_state(CatalogState *state)
-{
-	if (state->form_class)
-		pfree(state->form_class);
-
-	if (state->desc_class)
-		pfree(state->desc_class);
-
-	if (state->rel.attr_xmins)
-		pfree(state->rel.attr_xmins);
-
-	if (state->indexes)
-		pfree(state->indexes);
-
-	if (state->comptypes)
-	{
-		int			i;
-
-		for (i = 0; i < state->ncomptypes; i++)
-		{
-			TypeCatInfo *tinfo = &state->comptypes[i];
-
-			if (tinfo->rel.attr_xmins)
-				pfree(tinfo->rel.attr_xmins);
-		}
-		pfree(state->comptypes);
-	}
-	pfree(state);
 }
 
 /*
@@ -3022,59 +2130,35 @@ static bool
 perform_final_merge(EState *estate,
 					ModifyTableState *mtstate,
 					struct PartitionTupleRouting *proute,
-					Oid relid_src, Oid *indexes_src, int nindexes,
+					Relation rel_src,
 					ScanKey ident_key,
 					int ident_key_nentries,
 					Relation ident_index,
 					TupleTableSlot *slot_dst_ind,
-					CatalogState *cat_state,
 					LogicalDecodingContext *ctx,
 					partitions_hash *partitions,
 					TupleConversionMapExt *conv_map)
 {
-	Relation	rel_src;
 	bool		success;
 	XLogRecPtr	xlog_insert_ptr,
 				end_of_wal;
-	int			i;
 	struct timeval t_end;
 	struct timeval *t_end_ptr = NULL;
 	char		dummy_rec_data = '\0';
+	List	*indexes;
+	ListCell	*lc;
 
 	/*
-	 * Lock the source table exclusively last time, to finalize the work.
-	 *
-	 * On pg_repack: before taking the exclusive lock, pg_repack extension is
-	 * more restrictive in waiting for other transactions to complete. That
-	 * might reduce the likelihood of MVCC-unsafe behavior that PG core admits
-	 * in some cases
-	 * (https://www.postgresql.org/docs/9.6/static/mvcc-caveats.html) but
-	 * can't completely avoid it anyway. On the other hand, pg_rewrite only
-	 * waits for completion of transactions which performed write (i.e. do
-	 * have XID assigned) - this is a side effect of bringing our replication
-	 * slot into consistent state.
-	 *
-	 * As pg_repack shows, extra effort makes little sense here, because some
-	 * other transactions still can start before the exclusive lock on the
-	 * source relation is acquired. In particular, if transaction A starts in
-	 * this period and commits a change, transaction B can miss it if the next
-	 * steps are as follows: 1. transaction B took a snapshot (e.g. it has
-	 * REPEATABLE READ isolation level), 2. pg_repack took the exclusive
-	 * relation lock and finished its work, 3. transaction B acquired shared
-	 * lock and performed its scan. (And of course, waiting for transactions
-	 * A, B, ... to complete while holding the exclusive lock can cause
-	 * deadlocks.)
+	 * Lock the source table exclusively, to finalize the work.
 	 */
-	rel_src = table_open(relid_src, AccessExclusiveLock);
+	LockRelationOid(RelationGetRelid(rel_src), AccessExclusiveLock);
 
 	/*
 	 * Lock the indexes too, as ALTER INDEX does not need table lock.
-	 *
-	 * The locking will succeed even if the index is no longer there. In that
-	 * case, ERROR will be raised during the catalog check below.
 	 */
-	for (i = 0; i < nindexes; i++)
-		LockRelationOid(indexes_src[i], AccessExclusiveLock);
+	indexes = RelationGetIndexList(rel_src);
+	foreach(lc, indexes)
+		LockRelationOid(lfirst_oid(lc), AccessExclusiveLock);
 
 	if (rewrite_max_xlock_time > 0)
 	{
@@ -3087,20 +2171,6 @@ perform_final_merge(EState *estate,
 		t_end.tv_usec = usec % USECS_PER_SEC;
 		t_end_ptr = &t_end;
 	}
-
-	/*
-	 * Check the source relation for DDLs once again. If this check passes, no
-	 * DDL can break the process anymore. NoLock must be passed because the
-	 * relation was really unlocked for some period since the last check.
-	 *
-	 * It makes sense to do this immediately after having acquired the
-	 * exclusive lock(s), so we don't waste any effort if the source table is
-	 * no longer compatible.
-	 */
-	pg_rewrite_check_catalog_changes(cat_state, NoLock);
-
-	/* rel_src cache entry is not needed anymore, but the lock is. */
-	table_close(rel_src, NoLock);
 
 	/*
 	 * Flush anything we see in WAL, to make sure that all changes committed
@@ -3139,7 +2209,6 @@ perform_final_merge(EState *estate,
 													proute,
 													ctx,
 													end_of_wal,
-													cat_state,
 													ident_key,
 													ident_key_nentries,
 													ident_index,
@@ -3150,11 +2219,11 @@ perform_final_merge(EState *estate,
 													t_end_ptr);
 	if (!success)
 	{
-		/* Unlock the relations and indexes. */
-		for (i = 0; i < nindexes; i++)
-			UnlockRelationOid(indexes_src[i], AccessExclusiveLock);
+		/* Unlock the relation and indexes. */
+		UnlockRelationOid(RelationGetRelid(rel_src), AccessExclusiveLock);
 
-		UnlockRelationOid(relid_src, AccessExclusiveLock);
+		foreach(lc, indexes)
+			UnlockRelationOid(lfirst_oid(lc), AccessExclusiveLock);
 
 		/*
 		 * Take time to reach end_of_wal.
@@ -3169,7 +2238,6 @@ perform_final_merge(EState *estate,
 											  proute,
 											  ctx,
 											  end_of_wal,
-											  cat_state,
 											  ident_key,
 											  ident_key_nentries,
 											  ident_index,
@@ -3180,6 +2248,7 @@ perform_final_merge(EState *estate,
 											  NULL);
 	}
 
+	list_free(indexes);
 	return success;
 }
 

@@ -83,7 +83,6 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 									  struct PartitionTupleRouting *proute,
 									  LogicalDecodingContext *ctx,
 									  XLogRecPtr end_of_wal,
-									  CatalogState *cat_state,
 									  ScanKey ident_key,
 									  int ident_key_nentries,
 									  Relation ident_index,
@@ -121,9 +120,6 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 
 		if (dstate->nchanges == 0)
 			continue;
-
-		/* Make sure the changes are still applicable. */
-		pg_rewrite_check_catalog_changes(cat_state, lock_held);
 
 		/*
 		 * XXX Consider if it's possible to check *must_complete and stop

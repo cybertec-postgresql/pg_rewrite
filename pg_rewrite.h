@@ -99,94 +99,6 @@ extern XLogSegNo rewrite_current_segment;
 
 extern void _PG_init(void);
 
-/*
- * Subset of fields of pg_class, plus the necessary info on attributes. It
- * represents either the source relation or a composite type of the source
- * relation's attribute.
- */
-typedef struct PgClassCatInfo
-{
-	/* pg_class(oid) */
-	Oid			relid;
-
-	/*
-	 * pg_class(xmin)
-	 */
-	TransactionId xmin;
-
-	/* Array of pg_attribute(xmin). (Dropped columns are here too.) */
-	TransactionId *attr_xmins;
-	int16		relnatts;
-} PgClassCatInfo;
-
-/*
- * Information on source relation index, used to build the index on the
- * transient relation. To avoid repeated retrieval of the pg_index fields we
- * also add pg_class(xmin) and pass the same structure to
- * check_catalog_changes().
- */
-typedef struct IndexCatInfo
-{
-	Oid			oid;			/* pg_index(indexrelid) */
-	NameData	relname;		/* pg_class(relname) */
-	Oid			reltablespace;	/* pg_class(reltablespace) */
-	TransactionId xmin;			/* pg_index(xmin) */
-	TransactionId pg_class_xmin;	/* pg_class(xmin) of the index (not the
-									 * parent relation) */
-} IndexCatInfo;
-
-/*
- * If the source relation has attribute(s) of composite type, we need to check
- * for changes of those types.
- */
-typedef struct TypeCatInfo
-{
-	Oid			oid;			/* pg_type(oid) */
-	TransactionId xmin;			/* pg_type(xmin) */
-
-	/*
-	 * The pg_class entry whose oid == pg_type(typrelid) of this type.
-	 */
-	PgClassCatInfo rel;
-} TypeCatInfo;
-
-/*
- * Information to check whether an "incompatible" catalog change took
- * place. Such a change prevents us from completing processing of the current
- * table.
- */
-typedef struct CatalogState
-{
-	/* The relation whose changes we'll check for. */
-	PgClassCatInfo rel;
-
-	/* Copy of pg_class tuple of the source relation. */
-	Form_pg_class form_class;
-
-	/* Copy of pg_class tuple descriptor of the source relation. */
-	TupleDesc	desc_class;
-
-	/* Per-index info. */
-	int			relninds;
-	IndexCatInfo *indexes;
-
-	/* Composite types used by the source rel attributes. */
-	TypeCatInfo *comptypes;
-	/* Size of the array. */
-	int			ncomptypes_max;
-	/* Used elements of the array. */
-	int			ncomptypes;
-
-	/*
-	 * Does at least one index have wrong value of indisvalid, indisready or
-	 * indislive?
-	 */
-	bool		invalid_index;
-
-	/* Does the table have primary key index? */
-	bool		have_pk_index;
-} CatalogState;
-
 /* Progress tracking. */
 typedef struct TaskProgress
 {
@@ -344,15 +256,11 @@ extern void pg_rewrite_exit_if_requested(void);
  * Use function names distinct from those in pg_squeeze, in case both
  * extensions are installed.
  */
-extern void pg_rewrite_check_catalog_changes(CatalogState *state,
-											 LOCKMODE lock_held);
-
 extern bool pg_rewrite_process_concurrent_changes(EState *estate,
 												  ModifyTableState *mtstate,
 												  struct PartitionTupleRouting *proute,
 												  LogicalDecodingContext *ctx,
 												  XLogRecPtr end_of_wal,
-												  CatalogState *cat_state,
 												  ScanKey ident_key,
 												  int ident_key_nentries,
 												  Relation ident_index,
