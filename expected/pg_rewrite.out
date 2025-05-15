@@ -14,6 +14,24 @@ CREATE TABLE tab1_new_part_1 PARTITION OF tab1_new FOR VALUES FROM (0) TO (256);
 CREATE TABLE tab1_new_part_2 PARTITION OF tab1_new FOR VALUES FROM (256) TO (512);
 CREATE TABLE tab1_new_part_3 PARTITION OF tab1_new FOR VALUES FROM (512) TO (768);
 CREATE TABLE tab1_new_part_4 PARTITION OF tab1_new FOR VALUES FROM (768) TO (1024);
+-- Also test handling of constraints that require "manual" validation.
+ALTER TABLE tab1 ADD CHECK (k >= 0);
+CREATE TABLE tab1_fk(i int REFERENCES tab1);
+INSERT INTO tab1_fk(i) VALUES (1);
+\d tab1
+                Table "public.tab1"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           | not null | 
+ j      | integer |           |          | 
+ k      | integer |           |          | 
+Indexes:
+    "tab1_pkey" PRIMARY KEY, btree (i)
+Check constraints:
+    "tab1_k_check" CHECK (k >= 0)
+Referenced by:
+    TABLE "tab1_fk" CONSTRAINT "tab1_fk_i_fkey" FOREIGN KEY (i) REFERENCES tab1(i)
+
 -- Process the table.
 SELECT rewrite_table('tab1', 'tab1_new', 'tab1_orig');
  rewrite_table 
@@ -22,6 +40,41 @@ SELECT rewrite_table('tab1', 'tab1_new', 'tab1_orig');
 (1 row)
 
 -- tab1 should now be partitioned.
+\d tab1
+          Partitioned table "public.tab1"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           | not null | 
+ j      | integer |           |          | 
+ k      | integer |           |          | 
+Partition key: RANGE (i)
+Indexes:
+    "tab1_new_pkey" PRIMARY KEY, btree (i)
+Check constraints:
+    "tab1_k_check2" CHECK (k >= 0) NOT VALID
+Referenced by:
+    TABLE "tab1_fk" CONSTRAINT "tab1_fk_i_fkey2" FOREIGN KEY (i) REFERENCES tab1(i) NOT VALID
+Number of partitions: 4 (Use \d+ to list them.)
+
+-- Validate the constraints.
+ALTER TABLE tab1 VALIDATE CONSTRAINT tab1_k_check2;
+ALTER TABLE tab1_fk VALIDATE CONSTRAINT tab1_fk_i_fkey2;
+\d tab1
+          Partitioned table "public.tab1"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           | not null | 
+ j      | integer |           |          | 
+ k      | integer |           |          | 
+Partition key: RANGE (i)
+Indexes:
+    "tab1_new_pkey" PRIMARY KEY, btree (i)
+Check constraints:
+    "tab1_k_check2" CHECK (k >= 0)
+Referenced by:
+    TABLE "tab1_fk" CONSTRAINT "tab1_fk_i_fkey2" FOREIGN KEY (i) REFERENCES tab1(i)
+Number of partitions: 4 (Use \d+ to list them.)
+
 EXPLAIN SELECT * FROM tab1;
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------

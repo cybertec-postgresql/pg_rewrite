@@ -16,10 +16,25 @@ CREATE TABLE tab1_new_part_2 PARTITION OF tab1_new FOR VALUES FROM (256) TO (512
 CREATE TABLE tab1_new_part_3 PARTITION OF tab1_new FOR VALUES FROM (512) TO (768);
 CREATE TABLE tab1_new_part_4 PARTITION OF tab1_new FOR VALUES FROM (768) TO (1024);
 
+-- Also test handling of constraints that require "manual" validation.
+ALTER TABLE tab1 ADD CHECK (k >= 0);
+
+CREATE TABLE tab1_fk(i int REFERENCES tab1);
+INSERT INTO tab1_fk(i) VALUES (1);
+\d tab1
+
 -- Process the table.
 SELECT rewrite_table('tab1', 'tab1_new', 'tab1_orig');
 
 -- tab1 should now be partitioned.
+\d tab1
+
+-- Validate the constraints.
+ALTER TABLE tab1 VALIDATE CONSTRAINT tab1_k_check2;
+ALTER TABLE tab1_fk VALIDATE CONSTRAINT tab1_fk_i_fkey2;
+
+\d tab1
+
 EXPLAIN SELECT * FROM tab1;
 
 -- Check that the contents has not changed.

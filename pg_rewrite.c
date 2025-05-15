@@ -40,6 +40,7 @@
 #include "commands/tablespace.h"
 #include "executor/executor.h"
 #include "executor/execPartition.h"
+#include "executor/spi.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "nodes/primnodes.h"
@@ -67,6 +68,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
@@ -148,10 +150,10 @@ static bool perform_final_merge(EState *estate,
 								TupleConversionMapExt *conv_map);
 static void close_partitions(partitions_hash *partitions);
 
-static TupleConversionMapExt *convert_tuples_by_name_ext(TupleDesc indesc,
-														 TupleDesc outdesc);
 static AttrMapExt *make_attrmap_ext(int maplen);
 static void free_attrmap_ext(AttrMapExt *map);
+static TupleConversionMapExt *convert_tuples_by_name_ext(TupleDesc indesc,
+														 TupleDesc outdesc);
 static AttrMapExt *build_attrmap_by_name_if_req_ext(TupleDesc indesc,
 													TupleDesc outdesc);
 static AttrMapExt *build_attrmap_by_name_ext(TupleDesc indesc,
@@ -162,6 +164,18 @@ static TupleConversionMapExt *convert_tuples_by_name_attrmap_ext(TupleDesc indes
 																 TupleDesc outdesc,
 																 AttrMapExt *attrMap);
 static void free_conversion_map_ext(TupleConversionMapExt *map);
+static void copy_constraints(Oid relid_dst, const char *relname_dst,
+							 Oid relid_src);
+static void dump_fk_constraint(HeapTuple tup, Oid relid_dst,
+							   const char *relname_dst, Oid relid_src,
+							   StringInfo buf);
+static void dump_check_constraint(Oid relid_dst, const char *relname_dst,
+								  HeapTuple tup, StringInfo buf);
+static void dump_constraint_common(const char *nsp, const char *relname,
+								   Form_pg_constraint con, StringInfo buf);
+static int decompile_column_index_array(Datum column_index_array, Oid relId,
+										StringInfo buf);
+static bool data_type_changed(TupleConversionMapExt *conv_map);
 
 /*
  * The maximum time to hold AccessExclusiveLock on the source table during the
@@ -843,6 +857,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	RangeVar   *relrv;
 	Relation	rel_src,
 				rel_dst;
+	Oid			relid_dst;
 	Oid			ident_idx_src;
 	Oid			relid_src;
 	Relation	ident_index = NULL;
@@ -972,6 +987,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	relrv = makeRangeVar(relschema_dst, relname_dst, -1);
 	rel_dst = table_openrv(relrv, AccessExclusiveLock);
+	relid_dst = RelationGetRelid(rel_dst);
 
 	/*
 	 * If the destination table is temporary, user probably messed things up
@@ -1220,36 +1236,21 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 
 	pfree(ident_key);
 
-	/* Rename the tables. */
-	RenameRelationInternal(relid_src, relname_new, false, false);
-
 	/*
-	 * The new relation will be renamed to the old one, so make sure renaming
-	 * of the old one is visible, otherwise there's a conflict.
+	 * Besides explicitly closing rel_dst, make sure it (and possibly its
+	 * partitions) is not referenced indirectly copy_constraints() below runs
+	 * ALTER TABLE which in turn does not like leftover relcache references.
 	 */
-	CommandCounterIncrement();
-
-	/*
-	 * While the source should have been left locked (in the
-	 * AccessExclusiveLock mode) by perform_final_merge(), we keep the same
-	 * lock for rel_dst since we opened it first time.
-	 */
-	RenameRelationInternal(RelationGetRelid(rel_dst), relname_src, false,
-						   false);
-
-	/*
-	 * Everything done for destination table, so close it.
-	 *
-	 * Note that RenameRelationInternal() locked it in the exclusive mode too
-	 * and didn't unlock. We can perform one more unlocking explicitly, but
-	 * it'll happen on transaction commit anyway.
-	 *
-	 * As for the source relation, the lock acquired by perform_final_merge()
-	 * will be released at the end of transaction - no need to deal with it
-	 * here.
-	 */
-	table_close(rel_dst, AccessExclusiveLock);
-
+	if (proute)
+	{
+		ExecCleanupTupleRouting(mtstate, proute);
+		pfree(proute);
+	}
+	if (estate->es_partition_directory)
+	{
+		DestroyPartitionDirectory(estate->es_partition_directory);
+		estate->es_partition_directory = NULL;
+	}
 	if (partitions)
 	{
 		close_partitions(partitions);
@@ -1258,7 +1259,64 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 			table_close(parts_dst[i], AccessExclusiveLock);
 		pfree(parts_dst);
 	}
-	else
+
+	/*
+	 * The relcache reference is no longer needed, so close it. Unlocking will
+	 * will take place at the end of transaction.
+	 *
+	 * Note that RenameRelationInternal(relid_dst, ...) below will lock the
+	 * relation using AccessExclusiveLock mode once more. This lock will also
+	 * be released at the end of our transaction.
+	 */
+	table_close(rel_dst, NoLock);
+
+	/*
+	 * Rename the source table so that we can reuse its name (relname_src)
+	 * below.
+	 *
+	 * The lock acquired by perform_final_merge() will be released at the end
+	 * of transaction - no need to deal with it here. (The same applies to the
+	 * lock acquired by this call.)
+	 */
+	RenameRelationInternal(relid_src, relname_new, false, false);
+
+	/*
+	 * The relation we have just populated will be renamed so it replaces the
+	 * original one. Before that, make sure that the previous renaming is
+	 * visible so that we can reuse relname_src.
+	 */
+	CommandCounterIncrement();
+
+	/*
+	 * Finally, rename the newly populated relation so it replaces the
+	 * original one.
+	 *
+	 * We have AccessExclusiveLock lock on relid_dst since we opened it first
+	 * time and it will be released at the end of transaction (The same
+	 * applies to the lock acquired by this call.)
+	 */
+	RenameRelationInternal(relid_dst, relname_src, false, false);
+
+	/*
+	 * Create FK and CHECK constraints on rel_dst (renamed now to relname_src)
+	 * according to rel_src (renamed now to relname_new), and mark them NOT
+	 * VALID. See the comments of copy_constraints() for details.
+	 */
+	copy_constraints(relid_dst, relname_src, relid_src);
+	/*
+	 * TODO If the data type does not really require constraint validation
+	 * (some research is needed in this area), or if the user explicitly
+	 * asks to skip the validation, just set convalidated in the
+	 * corresponding rows of pg_constraint. Also use the "fast path" if
+	 * none of the constraints references the columns with changed data
+	 * type.
+	 */
+	if (!data_type_changed(conv_map))
+	{
+
+	}
+
+	if (partitions == NULL)
 	{
 		index_close(ident_index, AccessShareLock);
 		ExecDropSingleTupleTableSlot(slot_dst_ind);
@@ -1270,11 +1328,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	/* State not needed anymore. */
 	free_catalog_state(cat_state);
 
-	if (proute)
-	{
-		ExecCleanupTupleRouting(mtstate, proute);
-		pfree(proute);
-	}
 	free_modify_table_state(mtstate);
 	FreeExecutorState(estate);
 	if (conv_map)
@@ -3307,9 +3360,6 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 					/*
 					 * Can the input attribute be coerced to the output one?
 					 *
-					 * TODO Hard-wire data types for which we are sure that FK
-					 * validation can be skipped.
-					 *
 					 * XXX Currently we follow ATPrepAlterColumnType() in PG
 					 * core - should anything be different?
 					 */
@@ -3698,4 +3748,473 @@ pg_rewrite_get_task_list(PG_FUNCTION_ARGS)
 	else
 		SRF_RETURN_DONE(funcctx);
 #endif
+}
+
+/*
+ * SQL interface for copy_constraints(). This is for development and testing,
+ * not to be added to the extension's script.
+ *
+ * TODO Consider removal when development is finished.
+ */
+PG_FUNCTION_INFO_V1(pg_rewrite_create_constraints);
+Datum
+pg_rewrite_create_constraints(PG_FUNCTION_ARGS)
+{
+	text	*rel_t;
+	RangeVar	*rv;
+	Relation	rel;
+	Oid		relid_src, relid_dst;
+	const char	*relname_dst;
+
+	rel_t = PG_GETARG_TEXT_PP(0);
+	rv = makeRangeVarFromNameList(textToQualifiedNameList(rel_t));
+	rel = table_openrv(rv, AccessShareLock);
+	relid_src = RelationGetRelid(rel);
+	table_close(rel, AccessShareLock);
+
+	rel_t = PG_GETARG_TEXT_PP(1);
+	rv = makeRangeVarFromNameList(textToQualifiedNameList(rel_t));
+	rel = table_openrv(rv, AccessShareLock);
+	relid_dst = RelationGetRelid(rel);
+	relname_dst = pstrdup(RelationGetRelationName(rel));
+	table_close(rel, AccessShareLock);
+
+	copy_constraints(relid_dst, relname_dst, relid_src);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Create constraints on "destination relation" according to "source relation"
+ * and mark them NOT VALID.
+ *
+ * Type conversion(s) that we've done during rewriting must not break any
+ * constraints on the table. Even though all the tuples we insert (possibly
+ * converted) into the destination tuple had to be validated in the source
+ * table, we should be careful to say that the validity in the source table
+ * implies validity in the destination table. An obvious example is that
+ * float-to-int conversion on the FK side of an RI constraint can leave some
+ * rows in FK table with no matching rows in the PK table.
+ *
+ * We don't have to address PK, UNIQUE and EXCLUDE constraints here because
+ * these are enforced immediately as we run DMLs on the destination
+ * table. Thus we only need to tell the user that he should create these
+ * constraints. However, rewrite_table() works at low level and thus it
+ * by-passes checking of the other kinds of constraints.
+ *
+ * One way to address this problem could be to create the FK, CHECK and NOT
+ * NULL constraints on the rewritten table *after* the completion of
+ * rewrite_table(), but that would leave the table w/o constraints for some
+ * time. Moreover, AccessExclusiveLock would be needed for the constraint
+ * creation.
+ *
+ * Another possible approach would be to create the constraints while we're
+ * still holding AccessExclusiveLock (around the time we do table
+ * renaming). That would never leave the table w/o constraints, but it would
+ * still block access to the table for significant time. (Although it'd still
+ * be better than regular ALTER TABLE ... ALTER COLUMN ... SET DATA TYPE
+ * ... command, because this command holds the AccessExclusiveLock lock during
+ * the actual rewriting.)
+ *
+ * The least disruptive approach is apparently that we create the FK and CHECK
+ * constraints on the destination table and mark them NOT VALID, and let the
+ * user validate them "manually". The validation only needs
+ * ShareUpdateExclusiveLock, which does not block read / write access to the
+ * table. (Note that all data changes performed after rewrite_table() has
+ * finished are checked even with NOT VALID constraints.)
+ *
+ * Note on NOT NULL: this constraint cannot be created as NOT VALID in PG <=
+ * 17, so the only perfect way to handle this one is to create it after the
+ * completion of rewrite_table(). However, as type conversions usually do not
+ * change non-NULL value to NULL, it's probably o.k. to create the constraint
+ * before running rewrite_table().
+ *
+ * We actually create the NOT VALID constraints even if there is no type
+ * conversion - this is to avoid excessive blocking as explained
+ * above. However, in this case we can then safely change the 'convalidated'
+ * field of pg_constraint w/o actual validation. The user can also ask
+ * rewrite_table() to fake the validation this way if he is confident that
+ * particular data type conversion cannot affect validity of any
+ * constraints. This is probably true in the (supposedly) most common case of
+ * changing data type from integer to bigint. TODO The "fake validation" is
+ * yet to be implemented.
+ *
+ * OID and name of the destination table is passed instead of an open relcache
+ * entry because SPI requires the relation to be closed. We expect that the
+ * both relations are locked using AccessExclusiveLock mode.
+ */
+static void
+copy_constraints(Oid relid_dst, const char *relname_dst, Oid relid_src)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tuple;
+	StringInfo	buf = makeStringInfo();
+	List	*cmds = NIL;
+	ListCell	*lc;
+
+	/*
+	 * Iterate through all the constraints as we need to check both conrelid
+	 * and confrelid (there's no index on the latter).
+	 */
+	rel = table_open(ConstraintRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_constraint	con = (Form_pg_constraint) GETSTRUCT(tuple);
+
+		resetStringInfo(buf);
+
+		switch (con->contype)
+		{
+			case CONSTRAINT_CHECK:
+				if (con->conrelid == relid_src)
+					dump_check_constraint(relid_dst, relname_dst, tuple, buf);
+				break;
+
+			case CONSTRAINT_FOREIGN:
+				{
+					if (con->conrelid == relid_src ||
+						con->confrelid == relid_src)
+						dump_fk_constraint(tuple, relid_dst, relname_dst,
+										   relid_src, buf);
+					break;
+				}
+
+				/*
+				 * TODO We probably should raise ERROR if the table has
+				 * EXCLUDE constraint on the column whose data type we are
+				 * changing because this constraint cannot be marked as NOT
+				 * VALID. (If so, preliminary check before rewriting would
+				 * make sense so that we do not waste the effort on
+				 * rewriting.)
+				 */
+
+				/*
+				 * TODO Is it o.k. to assume that no data type conversion can
+				 * change the validity of NOT NULL constraint? The problem is
+				 * that NOT NULL cannot be set NOT VALID in PG < 18. At least
+				 * in PG >= 18 we probably should handle NOT NULL in the same
+				 * way as FK / CHECK constraints.
+				 */
+			default:
+				break;
+		}
+
+		/* Add the DDL to a list. */
+		if (strlen(buf->data) > 0)
+		{
+			appendStringInfoString(buf, " NOT VALID");
+
+			cmds = lappend(cmds, pstrdup(buf->data));
+		}
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	if (cmds == NIL)
+		return;
+
+	/* Run the commands. */
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	foreach(lc, cmds)
+	{
+		char	*cmd = (char *) lfirst(lc);
+		int	ret;
+
+		ret = SPI_execute(cmd, false, 0);
+		if (ret != SPI_OK_UTILITY)
+			ereport(ERROR, (errmsg("command failed: \"%s\"", cmd)));
+	}
+	PopActiveSnapshot();
+	SPI_finish();
+	list_free_deep(cmds);
+}
+
+static void
+dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
+				   Oid relid_src, StringInfo buf)
+{
+	Oid	relid_other;
+	const char *pkrelname, *pknsp, *fkrelname, *fknsp;
+	Form_pg_constraint	con = (Form_pg_constraint) GETSTRUCT(tup);
+	Datum		val;
+	bool		isnull;
+	const char *string;
+
+	Assert(con->contype == CONSTRAINT_FOREIGN);
+
+	if (con->conrelid == relid_src)
+	{
+		fknsp = get_namespace_name(relid_dst);
+		fkrelname = relname_dst;
+
+		relid_other = con->confrelid;
+		pknsp = get_namespace_name(relid_other);
+		pkrelname = get_rel_name(relid_other);
+	}
+	else
+	{
+		Assert(con->confrelid == relid_src);
+
+		pknsp = get_namespace_name(relid_dst);
+		pkrelname = relname_dst;
+
+		relid_other = con->conrelid;
+		fknsp = get_namespace_name(relid_other);
+		fkrelname = get_rel_name(relid_other);
+	}
+
+	dump_constraint_common(fknsp, fkrelname, con, buf);
+
+	/*
+	 * The rest is mostly copied from pg_get_constraintdef_worker() in PG
+	 * core.
+	 */
+
+	/* Start off the constraint definition */
+	appendStringInfoString(buf, "FOREIGN KEY (");
+
+	/* Fetch and build referencing-column list */
+	val = SysCacheGetAttrNotNull(CONSTROID, tup,
+								 Anum_pg_constraint_conkey);
+
+	decompile_column_index_array(val, con->conrelid, buf);
+
+	/* add foreign relation name */
+	appendStringInfo(buf, ") REFERENCES %s(",
+					 quote_qualified_identifier(pknsp, pkrelname));
+
+	/* Fetch and build referenced-column list */
+	val = SysCacheGetAttrNotNull(CONSTROID, tup,
+								 Anum_pg_constraint_confkey);
+
+	decompile_column_index_array(val, con->confrelid, buf);
+
+	appendStringInfoChar(buf, ')');
+
+	/* Add match type */
+	switch (con->confmatchtype)
+	{
+		case FKCONSTR_MATCH_FULL:
+			string = " MATCH FULL";
+			break;
+		case FKCONSTR_MATCH_PARTIAL:
+			string = " MATCH PARTIAL";
+			break;
+		case FKCONSTR_MATCH_SIMPLE:
+			string = "";
+			break;
+		default:
+			elog(ERROR, "unrecognized confmatchtype: %d",
+				 con->confmatchtype);
+			string = "";	/* keep compiler quiet */
+			break;
+	}
+	appendStringInfoString(buf, string);
+
+	/* Add ON UPDATE and ON DELETE clauses, if needed */
+	switch (con->confupdtype)
+	{
+		case FKCONSTR_ACTION_NOACTION:
+			string = NULL;	/* suppress default */
+			break;
+		case FKCONSTR_ACTION_RESTRICT:
+			string = "RESTRICT";
+			break;
+		case FKCONSTR_ACTION_CASCADE:
+			string = "CASCADE";
+			break;
+		case FKCONSTR_ACTION_SETNULL:
+			string = "SET NULL";
+			break;
+		case FKCONSTR_ACTION_SETDEFAULT:
+			string = "SET DEFAULT";
+			break;
+		default:
+			elog(ERROR, "unrecognized confupdtype: %d",
+				 con->confupdtype);
+			string = NULL;	/* keep compiler quiet */
+			break;
+	}
+	if (string)
+		appendStringInfo(buf, " ON UPDATE %s", string);
+
+	switch (con->confdeltype)
+	{
+		case FKCONSTR_ACTION_NOACTION:
+			string = NULL;	/* suppress default */
+			break;
+		case FKCONSTR_ACTION_RESTRICT:
+			string = "RESTRICT";
+			break;
+		case FKCONSTR_ACTION_CASCADE:
+			string = "CASCADE";
+			break;
+		case FKCONSTR_ACTION_SETNULL:
+			string = "SET NULL";
+			break;
+		case FKCONSTR_ACTION_SETDEFAULT:
+			string = "SET DEFAULT";
+			break;
+		default:
+			elog(ERROR, "unrecognized confdeltype: %d",
+				 con->confdeltype);
+			string = NULL;	/* keep compiler quiet */
+			break;
+	}
+	if (string)
+		appendStringInfo(buf, " ON DELETE %s", string);
+
+	/*
+	 * Add columns specified to SET NULL or SET DEFAULT if
+	 * provided.
+	 */
+	val = SysCacheGetAttr(CONSTROID, tup,
+						  Anum_pg_constraint_confdelsetcols, &isnull);
+	if (!isnull)
+	{
+		appendStringInfoString(buf, " (");
+		decompile_column_index_array(val, con->conrelid, buf);
+		appendStringInfoChar(buf, ')');
+	}
+}
+
+/*
+ * Mostly copied from pg_get_constraintdef_worker() in PG core.
+ */
+static void
+dump_check_constraint(Oid relid_dst, const char *relname_dst, HeapTuple tup,
+					  StringInfo buf)
+{
+	Datum		val;
+	char	   *conbin;
+	char	   *consrc;
+	Node	   *expr;
+	List	   *context;
+	Form_pg_constraint	con;
+	const char	*nsp;
+
+	con = (Form_pg_constraint) GETSTRUCT(tup);
+
+	nsp = get_namespace_name(relid_dst);
+	dump_constraint_common(nsp, relname_dst, con, buf);
+
+	/* Fetch constraint expression in parsetree form */
+	val = SysCacheGetAttrNotNull(CONSTROID, tup,
+								 Anum_pg_constraint_conbin);
+
+	conbin = TextDatumGetCString(val);
+	expr = stringToNode(conbin);
+
+	/* Set up deparsing context for Var nodes in constraint */
+	if (con->conrelid != InvalidOid)
+	{
+		/* relation constraint */
+		context = deparse_context_for(get_rel_name(con->conrelid),
+									  con->conrelid);
+	}
+	else
+	{
+		/* domain constraint --- can't have Vars */
+		context = NIL;
+	}
+
+	consrc = deparse_expression(expr, context, false, false);
+
+	/*
+	 * Now emit the constraint definition, adding NO INHERIT if
+	 * necessary.
+	 *
+	 * There are cases where the constraint expression will be
+	 * fully parenthesized and we don't need the outer parens ...
+	 * but there are other cases where we do need 'em.  Be
+	 * conservative for now.
+	 *
+	 * Note that simply checking for leading '(' and trailing ')'
+	 * would NOT be good enough, consider "(x > 0) AND (y > 0)".
+	 */
+	appendStringInfo(buf, "CHECK (%s)%s",
+					 consrc,
+					 con->connoinherit ? " NO INHERIT" : "");
+}
+
+static void
+dump_constraint_common(const char *nsp, const char *relname,
+					   Form_pg_constraint con, StringInfo buf)
+{
+	NameData	conname_new;
+	int		conname_len = strlen(NameStr(con->conname));
+
+	if ((conname_len + 1) == NAMEDATALEN)
+		/*
+		 * XXX Is it worth generating an unique name in another way? Not sure,
+		 * smart user can rename the original constraint.
+		 */
+		ereport(ERROR,
+				(errmsg("constraint name \"%s\" is too long, cannot add suffix",
+						NameStr(con->conname))));
+	else
+	{
+		namestrcpy(&conname_new, NameStr(con->conname));
+		/* Add '2' as a suffix. */
+		NameStr(conname_new)[conname_len] = '2';
+	}
+
+	appendStringInfo(buf, "ALTER TABLE %s ADD CONSTRAINT %s ",
+					 quote_qualified_identifier(nsp, relname),
+					 quote_identifier(NameStr(conname_new)));
+}
+
+/*
+ * Copied from PG core.
+ */
+static int
+decompile_column_index_array(Datum column_index_array, Oid relId,
+							 StringInfo buf)
+{
+	Datum	   *keys;
+	int			nKeys;
+	int			j;
+
+	/* Extract data from array of int16 */
+	deconstruct_array_builtin(DatumGetArrayTypeP(column_index_array), INT2OID,
+							  &keys, NULL, &nKeys);
+
+	for (j = 0; j < nKeys; j++)
+	{
+		char	   *colName;
+
+		colName = get_attname(relId, DatumGetInt16(keys[j]), false);
+
+		if (j == 0)
+			appendStringInfoString(buf, quote_identifier(colName));
+		else
+			appendStringInfo(buf, ", %s", quote_identifier(colName));
+	}
+
+	return nKeys;
+}
+
+/*
+ * Check if any column of the destination relation has a data type different
+ * from the corresponding column of the source relation.
+ */
+static bool
+data_type_changed(TupleConversionMapExt *conv_map)
+{
+	AttrMapExt    *attrMap;
+
+	if (conv_map == NULL)
+		return false;
+
+	attrMap = conv_map->attrMap;
+	for (int i = 0; i < attrMap->maplen; i++)
+	{
+		if (attrMap->coerceExprs[i])
+			return true;
+	}
+
+	return false;
 }
