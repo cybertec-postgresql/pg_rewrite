@@ -1192,6 +1192,11 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	}
 
 	free_modify_table_state(mtstate);
+	/*
+	 * ExecFindPartition() might have pinned tuple descriptors of the
+	 * partitions.
+	 */
+	ExecResetTupleTable(estate->es_tupleTable, true);
 	FreeExecutorState(estate);
 	if (conv_map)
 		free_conversion_map_ext(conv_map);
@@ -1525,11 +1530,8 @@ setup_decoding(Relation rel)
 
 	/*
 	 * Tuple descriptor of the source relation might be needed for decoding.
-	 *
-	 * Copy is needed because we'll close the relation before using the tuple
-	 * descriptor.
 	 */
-	dstate->tupdesc_src = CreateTupleDescCopy(RelationGetDescr(rel));
+	dstate->tupdesc_src = RelationGetDescr(rel);
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -1546,7 +1548,6 @@ decoding_cleanup(LogicalDecodingContext *ctx)
 
 	ExecDropSingleTupleTableSlot(dstate->tsslot);
 	FreeTupleDesc(dstate->tupdesc_change);
-	FreeTupleDesc(dstate->tupdesc_src);
 	tuplestore_end(dstate->tstore);
 
 	FreeDecodingContext(ctx);
