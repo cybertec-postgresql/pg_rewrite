@@ -2316,7 +2316,6 @@ free_attrmap_ext(AttrMapExt *map)
 	pfree(map);
 }
 
-
 /*
  * Like convert_tuples_by_name() in PG core, but try to coerce if the input
  * and output types differ.
@@ -2818,40 +2817,6 @@ pg_rewrite_get_task_list(PG_FUNCTION_ARGS)
 	else
 		SRF_RETURN_DONE(funcctx);
 #endif
-}
-
-/*
- * SQL interface for copy_constraints(). This is for development and testing,
- * not to be added to the extension's script.
- *
- * TODO Consider removal when development is finished.
- */
-PG_FUNCTION_INFO_V1(pg_rewrite_create_constraints);
-Datum
-pg_rewrite_create_constraints(PG_FUNCTION_ARGS)
-{
-	text	*rel_t;
-	RangeVar	*rv;
-	Relation	rel;
-	Oid		relid_src, relid_dst;
-	const char	*relname_dst;
-
-	rel_t = PG_GETARG_TEXT_PP(0);
-	rv = makeRangeVarFromNameList(textToQualifiedNameList(rel_t));
-	rel = table_openrv(rv, AccessShareLock);
-	relid_src = RelationGetRelid(rel);
-	table_close(rel, AccessShareLock);
-
-	rel_t = PG_GETARG_TEXT_PP(1);
-	rv = makeRangeVarFromNameList(textToQualifiedNameList(rel_t));
-	rel = table_openrv(rv, AccessShareLock);
-	relid_dst = RelationGetRelid(rel);
-	relname_dst = pstrdup(RelationGetRelationName(rel));
-	table_close(rel, AccessShareLock);
-
-	copy_constraints(relid_dst, relname_dst, relid_src);
-
-	PG_RETURN_VOID();
 }
 
 /*
