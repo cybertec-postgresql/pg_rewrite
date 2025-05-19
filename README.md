@@ -129,7 +129,7 @@ exist between the two types.
 
 # Constraints
 
-The target table should obviously have the same constraints as the source
+The target table should obviously end up with same constraints as the source
 table. It's recommended to handle constraints creation this way:
 
 1.  Add PRIMARY KEY, UNIQUE and EXCLUDE constraints of the source table to the
@@ -145,13 +145,32 @@ table. It's recommended to handle constraints creation this way:
     target table, the data type conversion should not turn non-NULL value to
     NULL or vice versa.
 
-3.  CHECK and FOREIGN KEY are created automatically by `rewrite_table()` when
-    all the data changes have been applied to the target table. However, these
+3.  CHECK constraints are created automatically by `rewrite_table()` when all
+    the data changes have been applied to the target table. However, these
     constraints are created as NOT VALID, so you need to use the `ALTER TABLE
     ... VALIDATE CONSTRAINT ...` command to validate them.
 
-    Of course, the function could create the constraints immediately as valid,
-    but that would imply blocking access to the table for significant time.
+    (The function does not create these constraints immediately as valid,
+    because that would imply blocking access to the table for significant
+    time.)
+
+4.  FOREIGN KEY constraints are also created automatically and need to be
+    validated using the `ALTER TABLE ... VALIDATE CONSTRAINT ...` command,
+    unless the referencing table is partitioned: the NOT VALID option is
+    currently not supported for partitioned tables.
+
+    Therefore, if the referencing table is partitioned, you need to use the
+    `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` command after
+    `rewrite_table()` has finished. Please run the command as soon as possible
+    to minimize the risk that applications modify the database in a way that
+    violates the constraints.
+
+5.  Drop all foreign keys involving the source table.
+
+    You probably want to drop the source table anyway, but if you don't, you
+    should at least drop its FOREIGN KEY constraints. As the table was
+    renamed, applications will no longer update it. Therefore, attempts to
+    update the other tables involved in its foreign keys may cause errors.
 
 
 # Progress monitoring

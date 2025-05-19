@@ -2917,15 +2917,6 @@ copy_constraints(Oid relid_dst, const char *relname_dst, Oid relid_src)
 				}
 
 				/*
-				 * TODO We probably should raise ERROR if the table has
-				 * EXCLUDE constraint on the column whose data type we are
-				 * changing because this constraint cannot be marked as NOT
-				 * VALID. (If so, preliminary check before rewriting would
-				 * make sense so that we do not waste the effort on
-				 * rewriting.)
-				 */
-
-				/*
 				 * TODO Is it o.k. to assume that no data type conversion can
 				 * change the validity of NOT NULL constraint? The problem is
 				 * that NOT NULL cannot be set NOT VALID in PG < 18. At least
@@ -2982,6 +2973,16 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 
 	if (con->conrelid == relid_src)
 	{
+		/*
+		 * ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID is
+		 * currently not supported for partitioned FK table. XXX It might be
+		 * worth a NOTICE message, but how can we propagate the from the
+		 * worker to the launching backend? (Currently we only do that for >=
+		 * ERROR.)
+		 */
+		if (get_rel_relkind(relid_dst) == RELKIND_PARTITIONED_TABLE)
+			return;
+
 		fknsp = get_namespace_name(relid_dst);
 		fkrelname = relname_dst;
 
@@ -2992,6 +2993,13 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 	else
 	{
 		Assert(con->confrelid == relid_src);
+
+		/*
+		 * Like above, but check the existing FK table (because what we
+		 * rewrite now is the PK table.)
+		 */
+		if (get_rel_relkind(con->conrelid) == RELKIND_PARTITIONED_TABLE)
+			return;
 
 		pknsp = get_namespace_name(relid_dst);
 		pkrelname = relname_dst;

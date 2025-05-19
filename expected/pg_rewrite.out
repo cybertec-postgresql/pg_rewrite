@@ -225,7 +225,7 @@ TABLE tab4;
  1 | 0.10
 (1 row)
 
--- One more test for "manual" validation of FKs, this thime we rewrite the PK
+-- One more test for "manual" validation of FKs, this time we rewrite the PK
 -- table. The NOT VALID constraint cannot be used if the FK table is
 -- partitioned, so we need a separate test.
 CREATE TABLE tab1_pk(i int primary key);
@@ -270,4 +270,73 @@ Indexes:
     "tab1_pk_new_pkey" PRIMARY KEY, btree (i)
 Referenced by:
     TABLE "tab1_fk" CONSTRAINT "tab1_fk_i_fkey2" FOREIGN KEY (i) REFERENCES tab1_pk(i)
+
+-- For the partitioned FK table, test at least that the FK creation is skipped
+-- (i.e. ERROR saying that NOT VALID is not supported is no raised)
+DROP TABLE tab1_fk;
+CREATE TABLE tab1_fk(i int REFERENCES tab1_pk) PARTITION BY RANGE (i);
+CREATE TABLE tab1_fk_1 PARTITION OF tab1_fk DEFAULT;
+INSERT INTO tab1_fk(i) VALUES (1);
+ALTER TABLE tab1_pk_orig RENAME TO tab1_pk_new;
+TRUNCATE TABLE tab1_pk_new;
+\d tab1_fk
+        Partitioned table "public.tab1_fk"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           |          | 
+Partition key: RANGE (i)
+Foreign-key constraints:
+    "tab1_fk_i_fkey" FOREIGN KEY (i) REFERENCES tab1_pk(i)
+Number of partitions: 1 (Use \d+ to list them.)
+
+SELECT rewrite_table('tab1_pk', 'tab1_pk_new', 'tab1_pk_orig');
+ rewrite_table 
+---------------
+ 
+(1 row)
+
+-- Note that tab1_fk still references tab1_pk_orig - that's expected.
+\d tab1_fk
+        Partitioned table "public.tab1_fk"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           |          | 
+Partition key: RANGE (i)
+Foreign-key constraints:
+    "tab1_fk_i_fkey" FOREIGN KEY (i) REFERENCES tab1_pk_orig(i)
+Number of partitions: 1 (Use \d+ to list them.)
+
+-- The same once again, but now rewrite the FK table.
+DROP TABLE tab1_fk;
+DROP TABLE tab1_pk;
+ALTER TABLE tab1_pk_orig RENAME TO tab1_pk;
+CREATE TABLE tab1_fk(i int PRIMARY KEY REFERENCES tab1_pk);
+INSERT INTO tab1_fk(i) VALUES (1);
+CREATE TABLE tab1_fk_new(i int PRIMARY KEY) PARTITION BY RANGE (i);
+CREATE TABLE tab1_fk_new_1 PARTITION OF tab1_fk_new DEFAULT;
+\d tab1_fk
+              Table "public.tab1_fk"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           | not null | 
+Indexes:
+    "tab1_fk_pkey" PRIMARY KEY, btree (i)
+Foreign-key constraints:
+    "tab1_fk_i_fkey" FOREIGN KEY (i) REFERENCES tab1_pk(i)
+
+SELECT rewrite_table('tab1_fk', 'tab1_fk_new', 'tab1_fk_orig');
+ rewrite_table 
+---------------
+ 
+(1 row)
+
+\d tab1_fk
+        Partitioned table "public.tab1_fk"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           | not null | 
+Partition key: RANGE (i)
+Indexes:
+    "tab1_fk_new_pkey" PRIMARY KEY, btree (i)
+Number of partitions: 1 (Use \d+ to list them.)
 

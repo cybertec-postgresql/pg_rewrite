@@ -90,7 +90,7 @@ TABLE tab4;
 SELECT rewrite_table('tab4', 'tab4_new', 'tab4_orig');
 TABLE tab4;
 
--- One more test for "manual" validation of FKs, this thime we rewrite the PK
+-- One more test for "manual" validation of FKs, this time we rewrite the PK
 -- table. The NOT VALID constraint cannot be used if the FK table is
 -- partitioned, so we need a separate test.
 CREATE TABLE tab1_pk(i int primary key);
@@ -106,3 +106,30 @@ SELECT rewrite_table('tab1_pk', 'tab1_pk_new', 'tab1_pk_orig');
 \d tab1_pk
 ALTER TABLE tab1_fk VALIDATE CONSTRAINT tab1_fk_i_fkey2;
 \d tab1_pk
+
+-- For the partitioned FK table, test at least that the FK creation is skipped
+-- (i.e. ERROR saying that NOT VALID is not supported is no raised)
+DROP TABLE tab1_fk;
+CREATE TABLE tab1_fk(i int REFERENCES tab1_pk) PARTITION BY RANGE (i);
+CREATE TABLE tab1_fk_1 PARTITION OF tab1_fk DEFAULT;
+INSERT INTO tab1_fk(i) VALUES (1);
+
+ALTER TABLE tab1_pk_orig RENAME TO tab1_pk_new;
+TRUNCATE TABLE tab1_pk_new;
+
+\d tab1_fk
+SELECT rewrite_table('tab1_pk', 'tab1_pk_new', 'tab1_pk_orig');
+-- Note that tab1_fk still references tab1_pk_orig - that's expected.
+\d tab1_fk
+
+-- The same once again, but now rewrite the FK table.
+DROP TABLE tab1_fk;
+DROP TABLE tab1_pk;
+ALTER TABLE tab1_pk_orig RENAME TO tab1_pk;
+CREATE TABLE tab1_fk(i int PRIMARY KEY REFERENCES tab1_pk);
+INSERT INTO tab1_fk(i) VALUES (1);
+CREATE TABLE tab1_fk_new(i int PRIMARY KEY) PARTITION BY RANGE (i);
+CREATE TABLE tab1_fk_new_1 PARTITION OF tab1_fk_new DEFAULT;
+\d tab1_fk
+SELECT rewrite_table('tab1_fk', 'tab1_fk_new', 'tab1_fk_orig');
+\d tab1_fk
