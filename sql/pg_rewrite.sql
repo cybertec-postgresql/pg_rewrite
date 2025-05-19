@@ -89,3 +89,20 @@ CREATE TABLE tab4_new(i int PRIMARY KEY, j numeric(4, 2));
 TABLE tab4;
 SELECT rewrite_table('tab4', 'tab4_new', 'tab4_orig');
 TABLE tab4;
+
+-- One more test for "manual" validation of FKs, this thime we rewrite the PK
+-- table. The NOT VALID constraint cannot be used if the FK table is
+-- partitioned, so we need a separate test.
+CREATE TABLE tab1_pk(i int primary key);
+INSERT INTO tab1_pk(i) VALUES (1);
+CREATE TABLE tab1_pk_new(i bigint primary key);
+
+DROP TABLE tab1_fk;
+CREATE TABLE tab1_fk(i int REFERENCES tab1_pk);
+INSERT INTO tab1_fk(i) VALUES (1);
+
+\d tab1_pk
+SELECT rewrite_table('tab1_pk', 'tab1_pk_new', 'tab1_pk_orig');
+\d tab1_pk
+ALTER TABLE tab1_fk VALIDATE CONSTRAINT tab1_fk_i_fkey2;
+\d tab1_pk

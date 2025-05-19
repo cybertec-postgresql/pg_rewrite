@@ -225,3 +225,49 @@ TABLE tab4;
  1 | 0.10
 (1 row)
 
+-- One more test for "manual" validation of FKs, this thime we rewrite the PK
+-- table. The NOT VALID constraint cannot be used if the FK table is
+-- partitioned, so we need a separate test.
+CREATE TABLE tab1_pk(i int primary key);
+INSERT INTO tab1_pk(i) VALUES (1);
+CREATE TABLE tab1_pk_new(i bigint primary key);
+DROP TABLE tab1_fk;
+CREATE TABLE tab1_fk(i int REFERENCES tab1_pk);
+INSERT INTO tab1_fk(i) VALUES (1);
+\d tab1_pk
+              Table "public.tab1_pk"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ i      | integer |           | not null | 
+Indexes:
+    "tab1_pk_pkey" PRIMARY KEY, btree (i)
+Referenced by:
+    TABLE "tab1_fk" CONSTRAINT "tab1_fk_i_fkey" FOREIGN KEY (i) REFERENCES tab1_pk(i)
+
+SELECT rewrite_table('tab1_pk', 'tab1_pk_new', 'tab1_pk_orig');
+ rewrite_table 
+---------------
+ 
+(1 row)
+
+\d tab1_pk
+              Table "public.tab1_pk"
+ Column |  Type  | Collation | Nullable | Default 
+--------+--------+-----------+----------+---------
+ i      | bigint |           | not null | 
+Indexes:
+    "tab1_pk_new_pkey" PRIMARY KEY, btree (i)
+Referenced by:
+    TABLE "tab1_fk" CONSTRAINT "tab1_fk_i_fkey2" FOREIGN KEY (i) REFERENCES tab1_pk(i) NOT VALID
+
+ALTER TABLE tab1_fk VALIDATE CONSTRAINT tab1_fk_i_fkey2;
+\d tab1_pk
+              Table "public.tab1_pk"
+ Column |  Type  | Collation | Nullable | Default 
+--------+--------+-----------+----------+---------
+ i      | bigint |           | not null | 
+Indexes:
+    "tab1_pk_new_pkey" PRIMARY KEY, btree (i)
+Referenced by:
+    TABLE "tab1_fk" CONSTRAINT "tab1_fk_i_fkey2" FOREIGN KEY (i) REFERENCES tab1_pk(i)
+
