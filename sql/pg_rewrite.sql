@@ -81,3 +81,11 @@ TABLE tab3_new_part_1;
 TABLE tab3_new_part_2;
 TABLE tab3_new_part_3;
 TABLE tab3_new_part_4;
+
+-- Change of precision and scale of a numeric data type.
+CREATE TABLE tab4(i int PRIMARY KEY, j numeric(3, 1));
+INSERT INTO tab4(i, j) VALUES (1, 0.1);
+CREATE TABLE tab4_new(i int PRIMARY KEY, j numeric(4, 2));
+TABLE tab4;
+SELECT rewrite_table('tab4', 'tab4_new', 'tab4_orig');
+TABLE tab4;
