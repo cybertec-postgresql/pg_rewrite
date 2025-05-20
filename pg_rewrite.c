@@ -898,11 +898,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 * (ERRCODE_TRIGGERED_ACTION_EXCEPTION might be worth consideration as
 	 * well.)
 	 */
-	/*
-	 * TODO Consider
-	 * https://github.com/cybertec-postgresql/pg_squeeze/issues/84 (also
-	 * update README).
-	 */
 	if (!OidIsValid(ident_idx_src))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNIQUE_VIOLATION),

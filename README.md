@@ -101,11 +101,15 @@ CREATE TABLE measurement_y2006m03 PARTITION OF measurement_aux
 ```
 
 *It's essential that both the source (`measurement`) and target
-(`measurement_aux`) table have an identity index. The easiest way to ensure
-this is to create `PRIMARY KEY` or `UNIQUE` constraint. Also note that the key
-(i.e. column list) of the identity index of the source and target table must
-be identical. The identity is needed to process data changes that applications
-make while data is being copied from the source to the target table.*
+(`measurement_aux`) table have an identity index. It is needed to process data
+changes that applications make while data is being copied from the source to
+the target table. If the replica identity of the table is DEFAULT or FULL,
+primary key constraint provides the identity index. If your table has no
+primary key, you need to set the identity index explicitly using the [ALTER
+COMMAND ... REPLICA IDENTITY USING INDEX ...][1] command.
+
+Also note that the key (i.e. column list) of the identity index of the source
+and target table must be identical.*
 
 Then, in order to copy the data into the target table, run the
 `rewrite_table()` function and pass it both the source and target table, as
@@ -241,7 +245,8 @@ it needs.
    a table which is being rewritten.
 
 2. The `rewrite_table()` function allows for MVCC-unsafe behavior described in
-   the first paragraph of [mvcc-caveats][1].
+   the first paragraph of [mvcc-caveats][2].
 
 
-[1]: https://www.postgresql.org/docs/current/mvcc-caveats.html
+[1] https://www.postgresql.org/docs/17/sql-altertable.html
+[2] https://www.postgresql.org/docs/current/mvcc-caveats.html
