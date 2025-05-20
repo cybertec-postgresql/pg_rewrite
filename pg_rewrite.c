@@ -2295,6 +2295,7 @@ make_attrmap_ext(int maplen)
 	res = (AttrMapExt *) palloc0(sizeof(AttrMapExt));
 	res->maplen = maplen;
 	res->attnums = (AttrNumber *) palloc0(sizeof(AttrNumber) * maplen);
+	res->dropped_attr = false;
 	res->coerceExprs = palloc0_array(Node *, maplen);
 	return res;
 }
@@ -2382,7 +2383,10 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 		int			j;
 
 		if (outatt->attisdropped)
+		{
+			attrMap->dropped_attr = true;
 			continue;			/* attrMap->attnums[i] is already 0 */
+		}
 		attname = NameStr(outatt->attname);
 		atttypid = outatt->atttypid;
 		atttypmod = outatt->atttypmod;
@@ -2408,7 +2412,10 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 
 			inatt = TupleDescAttr(indesc, nextindesc);
 			if (inatt->attisdropped)
+			{
+				attrMap->dropped_attr = true;
 				continue;
+			}
 			if (strcmp(attname, NameStr(inatt->attname)) == 0)
 			{
 				/* Found it, check type */
@@ -2475,6 +2482,14 @@ check_attrmap_match_ext(TupleDesc indesc,
 						AttrMapExt *attrMap)
 {
 	int			i;
+
+	/*
+	 * Dropped attribute in either descriptor makes the function return false,
+	 * even if it appears in both descriptors and at the same position. Thus
+	 * we (mis)use the map to get rid of the values of the dropped columns.
+	 */
+	if (attrMap->dropped_attr)
+		return false;
 
 	/* no match if attribute numbers are not the same */
 	if (indesc->natts != outdesc->natts)

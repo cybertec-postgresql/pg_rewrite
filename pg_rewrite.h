@@ -180,6 +180,8 @@ typedef struct AttrMapExt
 {
 	AttrNumber *attnums;
 	int			maplen;
+	bool	dropped_attr;	/* Has outer or inner descriptor a dropped
+							 * attribute? */
 	Node	**coerceExprs;	/* Non-NULL field tells how to convert the input
 							 * value to the output data type. NULL indicates
 							 * that no conversion is needed. */
