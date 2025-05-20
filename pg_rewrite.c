@@ -152,6 +152,10 @@ static void dump_fk_constraint(HeapTuple tup, Oid relid_dst,
 							   StringInfo buf);
 static void dump_check_constraint(Oid relid_dst, const char *relname_dst,
 								  HeapTuple tup, StringInfo buf);
+#if PG_VERSION_NUM >= 180000
+static void dump_null_constraint(Oid relid_dst, const char *relname_dst,
+								 HeapTuple tup, StringInfo buf);
+#endif
 static void dump_constraint_common(const char *nsp, const char *relname,
 								   Form_pg_constraint con, StringInfo buf);
 static int decompile_column_index_array(Datum column_index_array, Oid relId,
@@ -2916,13 +2920,15 @@ copy_constraints(Oid relid_dst, const char *relname_dst, Oid relid_src)
 					break;
 				}
 
-				/*
-				 * TODO Is it o.k. to assume that no data type conversion can
-				 * change the validity of NOT NULL constraint? The problem is
-				 * that NOT NULL cannot be set NOT VALID in PG < 18. At least
-				 * in PG >= 18 we probably should handle NOT NULL in the same
-				 * way as FK / CHECK constraints.
-				 */
+#if PG_VERSION_NUM >= 180000
+			case CONSTRAINT_NOTNULL:
+				{
+					if (con->conrelid == relid_src)
+						dump_null_constraint(relid_dst, relname_dst, tuple,
+											 buf);
+					break;
+				}
+#endif
 			default:
 				break;
 		}
@@ -3182,6 +3188,31 @@ dump_check_constraint(Oid relid_dst, const char *relname_dst, HeapTuple tup,
 					 consrc,
 					 con->connoinherit ? " NO INHERIT" : "");
 }
+
+#if PG_VERSION_NUM >= 180000
+static void
+dump_null_constraint(Oid relid_dst, const char *relname_dst,
+					 HeapTuple tup, StringInfo buf)
+{
+	Form_pg_constraint	con = (Form_pg_constraint) GETSTRUCT(tup);
+	const char	*nsp;
+	AttrNumber	attnum;
+
+	Assert(con->contype == CONSTRAINT_NOTNULL);
+
+	nsp = get_namespace_name(relid_dst);
+	dump_constraint_common(nsp, relname_dst, con, buf);
+
+	attnum = extractNotNullColumn(tup);
+
+	appendStringInfo(buf, "NOT NULL %s",
+					 quote_identifier(get_attname(con->conrelid,
+												  attnum, false)));
+	if (((Form_pg_constraint) GETSTRUCT(tup))->connoinherit)
+		appendStringInfoString(buf, " NO INHERIT");
+
+}
+#endif
 
 static void
 dump_constraint_common(const char *nsp, const char *relname,

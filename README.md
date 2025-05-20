@@ -139,11 +139,12 @@ table. It's recommended to handle constraints creation this way:
     but it does not hurt to check them in the target table, especially if the
     column data type is being changed.)
 
-2.  Add NOT NULL constraints. `rewrite_table()` by-passes validation of these,
-    but all the rows it inserts into the target table must have been validated
-    in the source table. Even if the column data tape is different in the
-    target table, the data type conversion should not turn non-NULL value to
-    NULL or vice versa.
+2.  If the version of PostgreSQL server is 17 or lower, add NOT NULL
+    constraints. `rewrite_table()` by-passes validation of these, but all the
+    rows it inserts into the target table must have been validated in the
+    source table. Even if the column data tape is different in the target
+    table, the data type conversion should not turn non-NULL value to NULL or
+    vice versa.
 
 3.  CHECK constraints are created automatically by `rewrite_table()` when all
     the data changes have been applied to the target table. However, these
@@ -151,10 +152,14 @@ table. It's recommended to handle constraints creation this way:
     ... VALIDATE CONSTRAINT ...` command to validate them.
 
     (The function does not create these constraints immediately as valid,
-    because that would imply blocking access to the table for significant
+    because that could imply blocking access to the table for significant
     time.)
 
-4.  FOREIGN KEY constraints are also created automatically and need to be
+4.  If the version of PostgreSQL server is 18 or higher, NOT NULL constraints
+    are also created automatically and need to be validated using the `ALTER
+    TABLE ... VALIDATE CONSTRAINT ...` command.
+
+5.  FOREIGN KEY constraints are also created automatically and need to be
     validated using the `ALTER TABLE ... VALIDATE CONSTRAINT ...` command,
     unless the referencing table is partitioned: the NOT VALID option is
     currently not supported for partitioned tables.
@@ -165,7 +170,7 @@ table. It's recommended to handle constraints creation this way:
     to minimize the risk that applications modify the database in a way that
     violates the constraints.
 
-5.  Drop all foreign keys involving the source table.
+6.  Drop all foreign keys involving the source table.
 
     You probably want to drop the source table anyway, but if you don't, you
     should at least drop its FOREIGN KEY constraints. As the table was
