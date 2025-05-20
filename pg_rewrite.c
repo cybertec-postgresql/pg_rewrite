@@ -162,7 +162,6 @@ static void dump_constraint_common(const char *nsp, const char *relname,
 								   Form_pg_constraint con, StringInfo buf);
 static int decompile_column_index_array(Datum column_index_array, Oid relId,
 										StringInfo buf);
-static bool data_type_changed(TupleConversionMapExt *conv_map);
 
 /*
  * The maximum time to hold AccessExclusiveLock on the source table during the
@@ -1181,18 +1180,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 * VALID. See the comments of copy_constraints() for details.
 	 */
 	copy_constraints(relid_dst, relname_src, relid_src);
-	/*
-	 * TODO If the data type does not really require constraint validation
-	 * (some research is needed in this area), or if the user explicitly
-	 * asks to skip the validation, just set convalidated in the
-	 * corresponding rows of pg_constraint. Also use the "fast path" if
-	 * none of the constraints references the columns with changed data
-	 * type.
-	 */
-	if (!data_type_changed(conv_map))
-	{
-
-	}
 
 	if (partitions == NULL)
 	{
@@ -3314,26 +3301,4 @@ decompile_column_index_array(Datum column_index_array, Oid relId,
 	}
 
 	return nKeys;
-}
-
-/*
- * Check if any column of the destination relation has a data type different
- * from the corresponding column of the source relation.
- */
-static bool
-data_type_changed(TupleConversionMapExt *conv_map)
-{
-	AttrMapExt    *attrMap;
-
-	if (conv_map == NULL)
-		return false;
-
-	attrMap = conv_map->attrMap;
-	for (int i = 0; i < attrMap->maplen; i++)
-	{
-		if (attrMap->coerceExprs[i])
-			return true;
-	}
-
-	return false;
 }
