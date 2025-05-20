@@ -2601,6 +2601,7 @@ pg_rewrite_execute_attr_map_tuple(HeapTuple tuple, TupleConversionMapExt *map)
 	/* Prepare for evaluation of coercion expressions. */
 	ResetPerTupleExprContext(map->estate);
 	ecxt = GetPerTupleExprContext(map->estate);
+	ExecClearTuple(map->in_slot);
 	ExecStoreHeapTuple(tuple, map->in_slot, false);
 	ecxt->ecxt_scantuple = map->in_slot;
 
@@ -2626,9 +2627,6 @@ pg_rewrite_execute_attr_map_tuple(HeapTuple tuple, TupleConversionMapExt *map)
 													 &outisnull[i]);
 		}
 	}
-
-	/* Cleanup. */
-	ExecClearTuple(map->in_slot);
 
 	/*
 	 * Now form the new tuple.
