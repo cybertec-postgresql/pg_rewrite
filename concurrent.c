@@ -695,7 +695,11 @@ find_tuple(HeapTuple tup, Relation rel, Relation ident_index, ScanKey key,
 
 	ident_form = ident_index->rd_index;
 	ident_indkey = &ident_form->indkey;
-	scan = index_beginscan(rel, ident_index, GetActiveSnapshot(), nkeys, 0);
+	scan = index_beginscan(rel, ident_index, GetActiveSnapshot(),
+#if PG_VERSION_NUM >= 180000
+						   NULL, /* instrument */
+#endif
+						   nkeys, 0);
 	index_rescan(scan, key, nkeys, NULL, 0);
 
 	/* Use the incoming tuple to finalize the scan key. */

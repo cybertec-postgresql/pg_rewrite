@@ -163,12 +163,12 @@ static bool data_type_changed(TupleConversionMapExt *conv_map);
  * final processing. Note that it only pg_rewrite_process_concurrent_changes()
  * execution time is included here.
  */
-int			rewrite_max_xlock_time = 0;
+static int			rewrite_max_xlock_time = 0;
 
 #if PG_VERSION_NUM >= 150000
-shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
-shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 void
 _PG_init(void)
