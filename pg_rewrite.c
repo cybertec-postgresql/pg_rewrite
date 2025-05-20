@@ -64,7 +64,9 @@
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#if PG_VERSION_NUM >= 170000
 #include "utils/injection_point.h"
+#endif
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -723,12 +725,13 @@ rewrite_worker_main(Datum main_arg)
 						   relname_dst);
 		CommitTransactionCommand();
 
+#if PG_VERSION_NUM >= 170000
 		/*
 		 * In regression tests, use this injection point to check that
 		 * the changes are visible by other transactions.
 		 */
 		INJECTION_POINT("pg_rewrite-after-commit");
-
+#endif
 	}
 	PG_CATCH();
 	{
@@ -1018,11 +1021,13 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	CommandCounterIncrement();
 
+#if PG_VERSION_NUM >= 170000
     /*
      * During testing, wait for another backend to perform concurrent data
      * changes which we will process below.
      */
     INJECTION_POINT("pg_rewrite-before-lock");
+#endif
 
 	/*
 	 * Flush all WAL records inserted so far (possibly except for the last
@@ -2779,11 +2784,11 @@ pg_rewrite_get_task_list(PG_FUNCTION_ARGS)
 			isnull = (bool *) palloc0(TASK_LIST_RES_ATTRS * sizeof(bool));
 
 
-			if (strlen(NameStr(task->relschema_src)) > 0)
-				values[0] = NameGetDatum(&task->relschema_src);
+			if (strlen(NameStr(task->relschema)) > 0)
+				values[0] = NameGetDatum(&task->relschema);
 			else
 				isnull[0] = true;
-			values[1] = NameGetDatum(&task->relname_src);
+			values[1] = NameGetDatum(&task->relname);
 			if (strlen(NameStr(task->relschema_dst)) > 0)
 				values[2] = NameGetDatum(&task->relschema_dst);
 			else
@@ -2972,7 +2977,9 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 	const char *pkrelname, *pknsp, *fkrelname, *fknsp;
 	Form_pg_constraint	con = (Form_pg_constraint) GETSTRUCT(tup);
 	Datum		val;
+#if PG_VERSION_NUM >= 150000
 	bool		isnull;
+#endif
 	const char *string;
 
 	Assert(con->contype == CONSTRAINT_FOREIGN);
@@ -3026,8 +3033,18 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 	appendStringInfoString(buf, "FOREIGN KEY (");
 
 	/* Fetch and build referencing-column list */
+#if PG_VERSION_NUM >= 160000
 	val = SysCacheGetAttrNotNull(CONSTROID, tup,
 								 Anum_pg_constraint_conkey);
+#else
+	{
+		bool	isnull;
+
+		val = SysCacheGetAttr(CONSTROID, tup, Anum_pg_constraint_conkey,
+							  &isnull);
+		Assert(!isnull);
+	}
+#endif
 
 	decompile_column_index_array(val, con->conrelid, buf);
 
@@ -3036,8 +3053,18 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 					 quote_qualified_identifier(pknsp, pkrelname));
 
 	/* Fetch and build referenced-column list */
+#if PG_VERSION_NUM >= 160000
 	val = SysCacheGetAttrNotNull(CONSTROID, tup,
 								 Anum_pg_constraint_confkey);
+#else
+	{
+		bool	isnull;
+
+		val = SysCacheGetAttr(CONSTROID, tup, Anum_pg_constraint_confkey,
+							  &isnull);
+		Assert(!isnull);
+	}
+#endif
 
 	decompile_column_index_array(val, con->confrelid, buf);
 
@@ -3116,6 +3143,7 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 	if (string)
 		appendStringInfo(buf, " ON DELETE %s", string);
 
+#if PG_VERSION_NUM >= 150000
 	/*
 	 * Add columns specified to SET NULL or SET DEFAULT if
 	 * provided.
@@ -3128,6 +3156,7 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 		decompile_column_index_array(val, con->conrelid, buf);
 		appendStringInfoChar(buf, ')');
 	}
+#endif
 }
 
 /*
@@ -3151,8 +3180,18 @@ dump_check_constraint(Oid relid_dst, const char *relname_dst, HeapTuple tup,
 	dump_constraint_common(nsp, relname_dst, con, buf);
 
 	/* Fetch constraint expression in parsetree form */
+#if PG_VERSION_NUM >= 160000
 	val = SysCacheGetAttrNotNull(CONSTROID, tup,
 								 Anum_pg_constraint_conbin);
+#else
+	{
+		bool	isnull;
+
+		val = SysCacheGetAttr(CONSTROID, tup, Anum_pg_constraint_conbin,
+							  &isnull);
+		Assert(!isnull);
+	}
+#endif
 
 	conbin = TextDatumGetCString(val);
 	expr = stringToNode(conbin);
@@ -3253,8 +3292,14 @@ decompile_column_index_array(Datum column_index_array, Oid relId,
 	int			j;
 
 	/* Extract data from array of int16 */
+#if PG_VERSION_NUM >= 160000
 	deconstruct_array_builtin(DatumGetArrayTypeP(column_index_array), INT2OID,
 							  &keys, NULL, &nKeys);
+#else
+	deconstruct_array(DatumGetArrayTypeP(column_index_array), INT2OID,
+					  sizeof(int16), true, TYPALIGN_SHORT,
+					  &keys, NULL, &nKeys);
+#endif
 
 	for (j = 0; j < nKeys; j++)
 	{
