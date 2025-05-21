@@ -104,6 +104,8 @@ static WorkerTask *get_task(int *idx, char *relschema, char *relname,
 static void initialize_worker(BackgroundWorker *worker, int task_idx);
 static void run_worker(BackgroundWorker *worker, WorkerTask *task,
 					   bool nowait);
+static void send_message(WorkerTask *task, int elevel, const char *message,
+						 const char *detail);
 
 static void check_prerequisites(Relation rel);
 static LogicalDecodingContext *setup_decoding(Relation rel);
@@ -433,6 +435,7 @@ get_task(int *idx, char *relschema, char *relname, bool nowait)
 
 	task->msg[0] = '\0';
 	task->msg_detail[0] = '\0';
+	task->elevel = -1;
 
 	task->nowait = nowait;
 
@@ -473,6 +476,7 @@ run_worker(BackgroundWorker *worker, WorkerTask *task, bool nowait)
 	pid_t		pid;
 	char	*msg = NULL;
 	char	*msg_detail = NULL;
+	int		elevel = -1;
 
 	/*
 	 * Start the worker. Avoid leaking the task if the function ends due to
@@ -557,7 +561,10 @@ run_worker(BackgroundWorker *worker, WorkerTask *task, bool nowait)
 
 done:
 	if (strlen(task->msg) > 0)
+	{
 		msg = pstrdup(task->msg);
+		elevel = task->elevel;
+	}
 	if (strlen(task->msg_detail) > 0)
 		msg_detail = pstrdup(task->msg_detail);
 
@@ -567,12 +574,37 @@ done:
 	if (msg)
 	{
 		if (msg_detail)
-			ereport(ERROR, (errmsg("%s", msg),
-							errdetail("%s", msg_detail)));
+			ereport(elevel, (errmsg("%s", msg),
+							 errdetail("%s", msg_detail)));
 		else
-			ereport(ERROR, (errmsg("%s", msg)));
+			ereport(elevel, (errmsg("%s", msg)));
 	}
 
+}
+
+/*
+ * Send log message from the worker to the backend that launched it.
+ *
+ * Currently we only copy 'message' and 'detail. More fields can be added to
+ * WorkerTask if needed. Another limitation is that if the worker sends
+ * multiple messages, the backend only receives the last one.
+ *
+ * (Ideally we should use the message queue like parallel workers do, but the
+ * related PG core functions have some parallel worker specific arguments.)
+ */
+static void
+send_message(WorkerTask *task, int elevel, const char *message,
+			 const char *detail)
+{
+	strlcpy(task->msg, message, MAX_ERR_MSG_LEN);
+	task->elevel = elevel;
+	if (detail && strlen(detail) > 0)
+		strlcpy(task->msg_detail, detail, MAX_ERR_MSG_LEN);
+	else
+		/*
+		 * Message with elevel < ERROR could already have been written here.
+		 */
+		task->msg_detail[0] = '\0';
 }
 
 /* PG >= 14 does define this macro. */
@@ -776,15 +808,7 @@ rewrite_worker_main(Datum main_arg)
 
 		AbortOutOfAnyTransaction();
 
-		/*
-		 * Currently we only copy 'message' and 'detail.More information can
-		 * be added if needed. (Ideally we'd use the message queue like
-		 * parallel workers do, but the related PG core functions have some
-		 * parallel worker specific arguments.)
-		 */
-		strlcpy(task->msg, edata->message, MAX_ERR_MSG_LEN);
-		if (edata->detail && strlen(edata->detail) > 0)
-			strlcpy(task->msg_detail, edata->detail, MAX_ERR_MSG_LEN);
+		send_message(task, ERROR, edata->message, edata->detail);
 
 		FreeErrorData(edata);
 	}
@@ -2983,13 +3007,16 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 	{
 		/*
 		 * ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID is
-		 * currently not supported for partitioned FK table. XXX It might be
-		 * worth a NOTICE message, but how can we propagate the from the
-		 * worker to the launching backend? (Currently we only do that for >=
-		 * ERROR.)
+		 * currently not supported for partitioned FK table.
 		 */
 		if (get_rel_relkind(relid_dst) == RELKIND_PARTITIONED_TABLE)
+		{
+			send_message(MyWorkerTask,
+						 NOTICE,
+						 "FOREIGN KEY with NOT VALID option cannot be added to partitioned table",
+						 NULL);
 			return;
+		}
 
 		fknsp = get_namespace_name(relid_dst);
 		fkrelname = relname_dst;

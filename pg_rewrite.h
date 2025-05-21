@@ -150,12 +150,19 @@ typedef struct WorkerTask
 	NameData	relschema_dst;
 	NameData	relname_dst;
 
-	/* Space for the worker to send an error message to the backend. */
+	/*
+	 * Space for the worker to send an error message to the backend.
+	 *
+	 * XXX Note that later messages overwrite the earlier ones, so only the
+	 * last message is received. Is it worth using a queue instead?
+	 */
 #define	MAX_ERR_MSG_LEN	1024
 	char		msg[MAX_ERR_MSG_LEN];
 
 	/* Detailed error message. */
 	char		msg_detail[MAX_ERR_MSG_LEN];
+
+	int		elevel;
 
 	/*
 	 * Should rewrite_table() return w/o waiting for the worker's exit? If

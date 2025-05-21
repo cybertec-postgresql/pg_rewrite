@@ -325,6 +325,7 @@ Foreign-key constraints:
     "tab1_fk_i_fkey" FOREIGN KEY (i) REFERENCES tab1_pk(i)
 
 SELECT rewrite_table('tab1_fk', 'tab1_fk_new', 'tab1_fk_orig');
+NOTICE:  FOREIGN KEY with NOT VALID option cannot be added to partitioned table
  rewrite_table 
 ---------------
  
