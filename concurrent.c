@@ -6,7 +6,7 @@
  *	   This file handles changes that took place while the data is being
  *	   copied from one table to another one.
  *
- * Copyright (c) 2021-2023, Cybertec PostgreSQL International GmbH
+ * Copyright (c) 2021-2025, Cybertec PostgreSQL International GmbH
  *
  *-----------------------------------------------------------------------------------
  */

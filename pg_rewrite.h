@@ -1,11 +1,11 @@
-/*------------------------------------------------------------
+/*----------------------------------------------------------------
  *
  * pg_rewrite.h
  *     Tools for maintenance that requires table rewriting.
  *
- * Copyright (c) 2023, Cybertec PostgreSQL International GmbH
+ * Copyright (c) 2021-2025, Cybertec PostgreSQL International GmbH
  *
- *------------------------------------------------------------
+ *----------------------------------------------------------------
  */
 
 #include <sys/time.h>
