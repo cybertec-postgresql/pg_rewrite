@@ -341,3 +341,40 @@ Indexes:
     "tab1_fk_new_pkey" PRIMARY KEY, btree (i)
 Number of partitions: 1 (Use \d+ to list them.)
 
+-- Check if sequence on the target table is synchronized with that of the
+-- source table.
+CREATE TABLE tab5(i int primary key generated always as identity);
+CREATE TABLE tab5_new(i int primary key generated always as identity);
+INSERT INTO tab5(i) VALUES (DEFAULT);
+SELECT rewrite_table('tab5', 'tab5_new', 'tab5_orig');
+ rewrite_table 
+---------------
+ 
+(1 row)
+
+INSERT INTO tab5(i) VALUES (DEFAULT);
+SELECT i FROM tab5 ORDER BY i;
+ i 
+---
+ 1
+ 2
+(2 rows)
+
+-- The same with serial column.
+CREATE TABLE tab6(i serial primary key);
+CREATE TABLE tab6_new(i serial primary key);
+INSERT INTO tab6(i) VALUES (DEFAULT);
+SELECT rewrite_table('tab6', 'tab6_new', 'tab6_orig');
+ rewrite_table 
+---------------
+ 
+(1 row)
+
+INSERT INTO tab6(i) VALUES (DEFAULT);
+SELECT i FROM tab6 ORDER BY i;
+ i 
+---
+ 1
+ 2
+(2 rows)
+

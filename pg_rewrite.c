@@ -30,6 +30,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_control.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_tablespace.h"
@@ -79,6 +80,16 @@ PG_MODULE_MAGIC;
 #define	REPL_SLOT_BASE_NAME	"pg_rewrite_slot_"
 #define	REPL_PLUGIN_NAME	"pg_rewrite"
 
+/*
+ * Information needed to set sequences belonging the destination table
+ * according to the corresponding sequences of the source table.
+ */
+typedef struct SequenceValue
+{
+	NameData	attname;
+	int64		last_value;
+} SequenceValue;
+
 static void rewrite_table_impl(char *relschema_src, char *relname_src,
 							   char *relname_new, char *relschema_dst,
 							   char *relname_dst);
@@ -88,6 +99,10 @@ static partitions_hash *get_partitions(Relation rel_src, Relation rel_dst,
 									   Relation **parts_dst_p,
 									   ScanKey *ident_key_p,
 									   int *ident_key_nentries);
+static List *get_sequences(Relation rel);
+static List *getOwnedSequences_internal(Oid relid, AttrNumber attnum,
+										char deptype);
+static void set_sequences(Relation rel, List *seqs_src);
 
 /* The WAL segment being decoded. */
 XLogSegNo	rewrite_current_segment = 0;
@@ -889,6 +904,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	EState	   *estate;
 	ModifyTableState *mtstate;
 	struct PartitionTupleRouting *proute = NULL;
+	List	*seqs_src;
 
 	/*
 	 * Use ShareUpdateExclusiveLock as it allows DML commands but does block
@@ -1118,6 +1134,12 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("pg_rewrite: \"max_xlock_time\" prevented partitioning from completion")));
 
+	/*
+	 * Retrieve information on sequences so that we can eventually set them on
+	 * rel_dst.
+	 */
+	seqs_src = get_sequences(rel_src);
+
 	/* rel_src cache entry is not needed anymore, but the lock is. */
 	table_close(rel_src, NoLock);
 
@@ -1154,6 +1176,17 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 		for (i = 0; i < nparts; i++)
 			table_close(parts_dst[i], AccessExclusiveLock);
 		pfree(parts_dst);
+	}
+
+	/*
+	 * If the source table had sequences, apply their values to the
+	 * corresponding sequences of the destination table.
+	 */
+	if (seqs_src)
+	{
+		set_sequences(rel_dst, seqs_src);
+
+		list_free_deep(seqs_src);
 	}
 
 	/*
@@ -1200,6 +1233,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	copy_constraints(relid_dst, relname_src, relid_src);
 
+	/* Cleanup */
 	if (partitions == NULL)
 	{
 		index_close(ident_index, AccessShareLock);
@@ -1376,6 +1410,187 @@ get_partitions(Relation rel_src, Relation rel_dst, int *nparts,
 	*parts_dst_p = parts_dst;
 
 	return partitions;
+}
+
+/*
+ * Return a list of SequenceValue for given relation.
+ */
+static List *
+get_sequences(Relation rel)
+{
+	Oid		foid;
+	FmgrInfo	flinfo;
+	TupleDesc	tupdesc;
+	List	*result = NIL;
+	bool	skipped = false;
+
+	foid = fmgr_internal_function("pg_sequence_last_value");
+	Assert(OidIsValid(foid));
+	fmgr_info(foid, &flinfo);
+
+	tupdesc = RelationGetDescr(rel);
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		List	*seqlist;
+		Oid		seqid;
+		LOCAL_FCINFO(fcinfo, 1);
+		Datum	last_value;
+
+		Assert(attr->attnum == (i + 1));
+		if (attr->attisdropped)
+			continue;
+		seqlist = getOwnedSequences_internal(RelationGetRelid(rel),
+											 attr->attnum, 0);
+		/*
+		 * Obviously do nothing if there is no sequence for the attribute. If
+		 * there are more then one, ignore that attribute too. The latter
+		 * probably should not happen, but if it does, we issue a log message
+		 * rather than aborting the whole rewrite.
+		 */
+		if (list_length(seqlist) != 1)
+		{
+			if (list_length(seqlist) > 1)
+				skipped = true;
+			continue;
+		}
+
+		seqid = linitial_oid(seqlist);
+
+		/*
+		 * FunctionCall1() cannot be used here because the function we call
+		 * can return NULL.
+		 */
+		InitFunctionCallInfoData(*fcinfo, &flinfo, 1, InvalidOid, NULL, NULL);
+		fcinfo->args[0].value = ObjectIdGetDatum(seqid);
+		fcinfo->args[0].isnull = false;
+		last_value = FunctionCallInvoke(fcinfo);
+		if (!fcinfo->args[0].isnull)
+		{
+			SequenceValue	*sv = palloc_object(SequenceValue);
+
+			sv->attname = attr->attname;
+			sv->last_value = DatumGetInt64(last_value);
+			result = lappend(result, sv);
+		}
+	}
+
+	if (skipped)
+		send_message(MyWorkerTask,
+					 NOTICE,
+					 "could not get sequence value(s) from the source table",
+					 NULL);
+
+	return result;
+}
+
+/*
+ * Copy & pasted from PG core. The problem is that we need to call the
+ * function with attnum > 0 and deptype = 0. PG core does not expose function
+ * that would do exactly that.
+ */
+static List *
+getOwnedSequences_internal(Oid relid, AttrNumber attnum, char deptype)
+{
+	List	   *result = NIL;
+	Relation	depRel;
+	ScanKeyData key[3];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	depRel = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	if (attnum)
+		ScanKeyInit(&key[2],
+					Anum_pg_depend_refobjsubid,
+					BTEqualStrategyNumber, F_INT4EQ,
+					Int32GetDatum(attnum));
+
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+							  NULL, attnum ? 3 : 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend deprec = (Form_pg_depend) GETSTRUCT(tup);
+
+		/*
+		 * We assume any auto or internal dependency of a sequence on a column
+		 * must be what we are looking for.  (We need the relkind test because
+		 * indexes can also have auto dependencies on columns.)
+		 */
+		if (deprec->classid == RelationRelationId &&
+			deprec->objsubid == 0 &&
+			deprec->refobjsubid != 0 &&
+			(deprec->deptype == DEPENDENCY_AUTO || deprec->deptype == DEPENDENCY_INTERNAL) &&
+			get_rel_relkind(deprec->objid) == RELKIND_SEQUENCE)
+		{
+			if (!deptype || deprec->deptype == deptype)
+				result = lappend_oid(result, deprec->objid);
+		}
+	}
+
+	systable_endscan(scan);
+
+	table_close(depRel, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * Set sequences according to the information retrieved by get_sequences().
+ */
+static void
+set_sequences(Relation rel, List *seqs_src)
+{
+	Oid		relid = RelationGetRelid(rel);
+	Oid		foid;
+	FmgrInfo	flinfo;
+	ListCell	*lc;
+	bool	skipped = false;
+
+	foid = fmgr_internal_function("setval_oid");
+	Assert(OidIsValid(foid));
+	fmgr_info(foid, &flinfo);
+
+	foreach(lc, seqs_src)
+	{
+		SequenceValue	*sv = (SequenceValue *) lfirst(lc);
+		AttrNumber	attnum;
+		List	*seqlist;
+		Oid		seqid;
+
+		attnum = get_attnum(relid, NameStr(sv->attname));
+		seqlist = getOwnedSequences_internal(relid, attnum, 0);
+
+		/*
+		 * Unlike get_sequences(), here we have a problem even if there is no
+		 * sequence on the attribute. (Because we know that the sequence
+		 * exists on the source table.)
+		 */
+		if (list_length(seqlist) != 1)
+		{
+			skipped = true;
+			continue;
+		}
+
+		seqid = linitial_oid(seqlist);
+
+		FunctionCall2(&flinfo, ObjectIdGetDatum(seqid),
+					  Int64GetDatum(sv->last_value));
+	}
+
+	if (skipped)
+		send_message(MyWorkerTask, NOTICE,
+					 "could not identify sequence(s) on the target table",
+					 NULL);
 }
 
 /*

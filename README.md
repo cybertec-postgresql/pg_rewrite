@@ -181,6 +181,14 @@ table. It's recommended to handle constraints creation this way:
     renamed, applications will no longer update it. Therefore, attempts to
     update the other tables involved in its foreign keys may cause errors.
 
+# Sequences
+
+If a sequence is used to generate column value in the source table (typically
+the column data type is `serial` or the column is declared `GENARATED ... AS
+IDENTITY`), and if `rewrite_table()` finds the corresponding sequence for the
+target table, it sets its value according to the sequence for the source
+table. If it cannot identify the sequence for the target table, a log message
+is printed out.
 
 # Progress monitoring
 

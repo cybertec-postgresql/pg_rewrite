@@ -133,3 +133,20 @@ CREATE TABLE tab1_fk_new_1 PARTITION OF tab1_fk_new DEFAULT;
 \d tab1_fk
 SELECT rewrite_table('tab1_fk', 'tab1_fk_new', 'tab1_fk_orig');
 \d tab1_fk
+
+-- Check if sequence on the target table is synchronized with that of the
+-- source table.
+CREATE TABLE tab5(i int primary key generated always as identity);
+CREATE TABLE tab5_new(i int primary key generated always as identity);
+INSERT INTO tab5(i) VALUES (DEFAULT);
+SELECT rewrite_table('tab5', 'tab5_new', 'tab5_orig');
+INSERT INTO tab5(i) VALUES (DEFAULT);
+SELECT i FROM tab5 ORDER BY i;
+
+-- The same with serial column.
+CREATE TABLE tab6(i serial primary key);
+CREATE TABLE tab6_new(i serial primary key);
+INSERT INTO tab6(i) VALUES (DEFAULT);
+SELECT rewrite_table('tab6', 'tab6_new', 'tab6_orig');
+INSERT INTO tab6(i) VALUES (DEFAULT);
+SELECT i FROM tab6 ORDER BY i;
