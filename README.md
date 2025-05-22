@@ -144,16 +144,17 @@ table. It's recommended to handle constraints creation this way:
     column data type is being changed.)
 
 2.  If the version of PostgreSQL server is 17 or lower, add NOT NULL
-    constraints. `rewrite_table()` by-passes validation of these, but all the
-    rows it inserts into the target table must have been validated in the
-    source table. Even if the column data tape is different in the target
-    table, the data type conversion should not turn non-NULL value to NULL or
-    vice versa.
+    constraints of the source table to the target table. `rewrite_table()`
+    by-passes validation of these, but all the rows it inserts into the target
+    table must have been validated in the source table. Even if the column
+    data tape is different in the target table, the data type conversion
+    should not turn non-NULL value to NULL or vice versa.
 
-3.  CHECK constraints are created automatically by `rewrite_table()` when all
-    the data changes have been applied to the target table. However, these
-    constraints are created as NOT VALID, so you need to use the `ALTER TABLE
-    ... VALIDATE CONSTRAINT ...` command to validate them.
+3.  CHECK constraints are created automatically by `rewrite_table()`
+    (according to the source table) when all the data changes have been
+    applied to the target table. However, these constraints are created as NOT
+    VALID, so you need to use the `ALTER TABLE ... VALIDATE CONSTRAINT ...`
+    command to validate them.
 
     (The function does not create these constraints immediately as valid,
     because that could imply blocking access to the table for significant
@@ -163,10 +164,10 @@ table. It's recommended to handle constraints creation this way:
     are also created automatically and need to be validated using the `ALTER
     TABLE ... VALIDATE CONSTRAINT ...` command.
 
-5.  FOREIGN KEY constraints are also created automatically and need to be
-    validated using the `ALTER TABLE ... VALIDATE CONSTRAINT ...` command,
-    unless the referencing table is partitioned: the NOT VALID option is
-    currently not supported for partitioned tables.
+5.  FOREIGN KEY constraints are also created automatically (according to the
+    source table) and need to be validated using the `ALTER TABLE ... VALIDATE
+    CONSTRAINT ...` command, unless the referencing table is partitioned: the
+    NOT VALID option is currently not supported for partitioned tables.
 
     Therefore, if the referencing table is partitioned, you need to use the
     `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` command after
