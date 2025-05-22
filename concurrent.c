@@ -20,6 +20,29 @@
 #include "replication/decode.h"
 #include "utils/rel.h"
 
+typedef enum
+{
+	CHANGE_INSERT,
+	CHANGE_UPDATE_OLD,
+	CHANGE_UPDATE_NEW,
+	CHANGE_DELETE
+} ConcurrentChangeKind;
+
+typedef struct ConcurrentChange
+{
+	/* See the enum above. */
+	ConcurrentChangeKind kind;
+
+	/*
+	 * The actual tuple.
+	 *
+	 * The tuple data follows the ConcurrentChange structure. Before use make
+	 * sure the tuple is correctly aligned (ConcurrentChange can be stored as
+	 * bytea) and that tuple->t_data is fixed.
+	 */
+	HeapTupleData tup_data;
+} ConcurrentChange;
+
 static void apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 									 struct PartitionTupleRouting *proute,
 									 DecodingOutputState *dstate,
