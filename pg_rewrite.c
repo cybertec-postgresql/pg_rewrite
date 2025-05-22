@@ -2397,10 +2397,19 @@ perform_final_merge(EState *estate,
 		struct timeval t_start;
 
 		gettimeofday(&t_start, NULL);
+		/* Add the whole seconds. */
+		t_end.tv_sec = t_start.tv_sec + rewrite_max_xlock_time / 1000;
+		/* Add the rest, expressed in microseconds. */
 		usec = t_start.tv_usec + 1000 * (rewrite_max_xlock_time % 1000);
-		t_end.tv_sec = t_start.tv_sec + usec / USECS_PER_SEC;
+		/* The number of microseconds could have overflown. */
+		t_end.tv_sec += usec / USECS_PER_SEC;
 		t_end.tv_usec = usec % USECS_PER_SEC;
 		t_end_ptr = &t_end;
+
+		elog(DEBUG1,
+			 "pg_rewrite: completion required by %lu.%lu, current time is %lu.%lu.",
+			 t_end_ptr->tv_sec, t_end_ptr->tv_usec, t_start.tv_sec,
+			 t_start.tv_usec);
 	}
 
 	/*
@@ -2448,6 +2457,17 @@ perform_final_merge(EState *estate,
 													partitions,
 													conv_map,
 													t_end_ptr);
+
+	if (t_end_ptr)
+	{
+		struct timeval t_now;
+
+		gettimeofday(&t_now, NULL);
+		elog(DEBUG1,
+			 "pg_rewrite: concurrent changes processed at %lu.%lu, result: %u",
+			 t_now.tv_sec, t_now.tv_usec, success);
+	}
+
 	if (!success)
 	{
 		/* Unlock the relation and indexes. */
