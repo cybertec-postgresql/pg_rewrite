@@ -171,6 +171,8 @@ typedef struct WorkerTask
 	 * backend might be interested in 'msg' and 'msg_detail'.
 	 */
 	bool	nowait;
+
+	int             max_xlock_time;
 } WorkerTask;
 
 #define		MAX_TASKS	8

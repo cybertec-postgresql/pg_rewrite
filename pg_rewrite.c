@@ -453,6 +453,7 @@ get_task(int *idx, char *relschema, char *relname, bool nowait)
 	task->elevel = -1;
 
 	task->nowait = nowait;
+	task->max_xlock_time = rewrite_max_xlock_time;
 
 	*idx = i;
 	return task;
@@ -2395,12 +2396,13 @@ perform_final_merge(EState *estate,
 	{
 		int64		usec;
 		struct timeval t_start;
+		int		max_xlock_time = MyWorkerTask->max_xlock_time;
 
 		gettimeofday(&t_start, NULL);
 		/* Add the whole seconds. */
-		t_end.tv_sec = t_start.tv_sec + rewrite_max_xlock_time / 1000;
+		t_end.tv_sec = t_start.tv_sec + max_xlock_time / 1000;
 		/* Add the rest, expressed in microseconds. */
-		usec = t_start.tv_usec + 1000 * (rewrite_max_xlock_time % 1000);
+		usec = t_start.tv_usec + 1000 * (max_xlock_time % 1000);
 		/* The number of microseconds could have overflown. */
 		t_end.tv_sec += usec / USECS_PER_SEC;
 		t_end.tv_usec = usec % USECS_PER_SEC;
@@ -2497,6 +2499,11 @@ perform_final_merge(EState *estate,
 											  partitions,
 											  conv_map,
 											  NULL);
+
+		/* No time constraint, all changes must have been processed. */
+		Assert(((DecodingOutputState *)
+				ctx->output_writer_private)->nchanges == 0);
+
 	}
 
 	list_free(indexes);

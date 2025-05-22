@@ -27,7 +27,8 @@ static void apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 									 Relation ident_index,
 									 TupleTableSlot	*slot_dst_ind,
 									 partitions_hash *partitions,
-									 TupleConversionMapExt *conv_map);
+									 TupleConversionMapExt *conv_map,
+									 struct timeval *must_complete);
 static void apply_insert(HeapTuple tup, TupleTableSlot *slot,
 						 EState *estate, ModifyTableState *mtstate,
 						 struct PartitionTupleRouting *proute,
@@ -106,6 +107,20 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 			partitions && proute));
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
+
+	/*
+	 * If some changes could not be applied due to time constraint, make sure
+	 * the tuplestore is empty before we insert new tuples into it.
+	 */
+	if (dstate->nchanges > 0)
+		apply_concurrent_changes(estate, mtstate, proute,
+								 dstate, ident_key, ident_key_nentries,
+								 ident_index, slot_dst_ind,
+								 partitions, conv_map, must_complete);
+	/* Ran out of time? */
+	if (dstate->nchanges > 0)
+		return false;
+
 	done = false;
 	while (!done)
 	{
@@ -129,7 +144,10 @@ pg_rewrite_process_concurrent_changes(EState *estate,
 		apply_concurrent_changes(estate, mtstate, proute,
 								 dstate, ident_key, ident_key_nentries,
 								 ident_index, slot_dst_ind,
-								 partitions, conv_map);
+								 partitions, conv_map, must_complete);
+		/* Ran out of time? */
+		if (dstate->nchanges > 0)
+			return false;
 	}
 
 	return true;
@@ -233,7 +251,8 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 						 Relation ident_index,
 						 TupleTableSlot	*slot_dst_ind,
 						 partitions_hash *partitions,
-						 TupleConversionMapExt *conv_map)
+						 TupleConversionMapExt *conv_map,
+						 struct timeval *must_complete)
 {
 	BulkInsertState	bistate = NULL;
 	HeapTuple	tup_old = NULL;
@@ -271,6 +290,9 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		ConcurrentChange *change;
 		bool		isnull[1];
 		Datum		values[1];
+
+		Assert(dstate->nchanges > 0);
+		dstate->nchanges--;
 
 		/* Get the change from the single-column tuple. */
 		tup_change = ExecFetchSlotHeapTuple(dstate->tsslot, false, &shouldFree);
@@ -320,10 +342,22 @@ apply_concurrent_changes(EState *estate, ModifyTableState *mtstate,
 		/* TTSOpsMinimalTuple has .get_heap_tuple==NULL. */
 		Assert(shouldFree);
 		pfree(tup_change);
+
+		/*
+		 * If there is a limit on the time of completion, check it
+		 * now. However, make sure the loop does not break if tup_old was set
+		 * in the previous iteration. In such a case we could not resume the
+		 * processing in the next call.
+		 */
+		if (must_complete && tup_old == NULL &&
+			processing_time_elapsed(must_complete))
+			/* The next call will process the remaining changes. */
+			break;
 	}
 
-	tuplestore_clear(dstate->tstore);
-	dstate->nchanges = 0;
+	/* If we could not apply all the changes, the next call will do. */
+	if (dstate->nchanges == 0)
+		tuplestore_clear(dstate->tstore);
 
 	PopActiveSnapshot();
 
