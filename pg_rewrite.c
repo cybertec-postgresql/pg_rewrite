@@ -1024,8 +1024,10 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	/*
 	 * The historic snapshot is used to retrieve data w/o concurrent changes.
 	 */
+	snap_hist = RegisterSnapshot(snap_hist);
 	perform_initial_load(estate, mtstate, proute, rel_src, snap_hist, rel_dst,
 						 partitions, ctx, conv_map);
+	UnregisterSnapshot(snap_hist);
 
 	/*
 	 * We no longer need to preserve the rows processed during the initial
@@ -1039,11 +1041,6 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 		   !TransactionIdIsValid(slot->data.xmin));
 	slot->effective_xmin = InvalidTransactionId;
 	SpinLockRelease(&slot->mutex);
-
-	/*
-	 * The historic snapshot won't be needed anymore.
-	 */
-	pfree(snap_hist);
 
 	/*
 	 * This is rather paranoia than anything else --- perform_initial_load()
