@@ -772,11 +772,13 @@ rewrite_worker_main(Datum main_arg)
 						   relname_dst);
 		CommitTransactionCommand();
 
-#if PG_VERSION_NUM >= 170000
 		/*
 		 * In regression tests, use this injection point to check that
 		 * the changes are visible by other transactions.
 		 */
+#if PG_VERSION_NUM >= 180000
+		INJECTION_POINT("pg_rewrite-after-commit", NULL);
+#elif PG_VERSION_NUM >= 170000
 		INJECTION_POINT("pg_rewrite-after-commit");
 #endif
 	}
@@ -1056,11 +1058,13 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	 */
 	CommandCounterIncrement();
 
-#if PG_VERSION_NUM >= 170000
     /*
      * During testing, wait for another backend to perform concurrent data
      * changes which we will process below.
      */
+#if PG_VERSION_NUM >= 180000
+	INJECTION_POINT("pg_rewrite-before-lock", NULL);
+#elif PG_VERSION_NUM >= 170000
     INJECTION_POINT("pg_rewrite-before-lock");
 #endif
 
