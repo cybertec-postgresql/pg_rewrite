@@ -980,6 +980,15 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	snap_hist = build_historic_snapshot(ctx->snapshot_builder);
 
 	/*
+	 * Cope with commit 706054b11b in PG core.
+	 *
+	 * If we did this earlier, earlier SnapBuildInitialSnapshot() would raise
+	 * ERROR. We shouldn't have called heap_insert|update|delete by now
+	 * anyway.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	/*
 	 * Create a conversion map so that we can handle difference(s) in the
 	 * tuple descriptor. Note that a copy is passed to 'indesc' since the map
 	 * contains a tuple slot based on this descriptor and since 'rel_src' will
@@ -1251,6 +1260,9 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	FreeExecutorState(estate);
 	if (conv_map)
 		free_conversion_map_ext(conv_map);
+
+	/* See the top of the function. */
+	PopActiveSnapshot();
 }
 
 /*
