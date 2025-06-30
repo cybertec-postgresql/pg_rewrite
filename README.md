@@ -166,14 +166,16 @@ table. It's recommended to handle constraints creation this way:
 
 5.  FOREIGN KEY constraints are also created automatically (according to the
     source table) and need to be validated using the `ALTER TABLE ... VALIDATE
-    CONSTRAINT ...` command, unless the referencing table is partitioned: the
-    NOT VALID option is currently not supported for partitioned tables.
+    CONSTRAINT ...` command, unless the referencing table is partitioned and
+    the version of PostgreSQL server is 17 or lower: those versions do not
+    support the NOT VALID option for partitioned tables.
 
-    Therefore, if the referencing table is partitioned, you need to use the
-    `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` command after
-    `rewrite_table()` has finished. Please run the command as soon as possible
-    to minimize the risk that applications modify the database in a way that
-    violates the constraints.
+    Therefore, if the referencing table is partitioned and if the server
+    version is 17 or lower, you need to use the `ALTER TABLE ... ADD
+    CONSTRAINT ... FOREIGN KEY ...` command after `rewrite_table()` has
+    finished. Please run the command as soon as possible to minimize the risk
+    that applications modify the database in a way that violates the
+    constraints.
 
 6.  Drop all foreign keys involving the source table.
 

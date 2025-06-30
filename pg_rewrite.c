@@ -3260,9 +3260,10 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 
 	if (con->conrelid == relid_src)
 	{
+#if PG_VERSION_NUM < 180000
 		/*
-		 * ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID is
-		 * currently not supported for partitioned FK table.
+		 * ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID is not
+		 * supported for partitioned FK table in PG < 18.
 		 */
 		if (get_rel_relkind(relid_dst) == RELKIND_PARTITIONED_TABLE)
 		{
@@ -3272,6 +3273,7 @@ dump_fk_constraint(HeapTuple tup, Oid relid_dst, const char *relname_dst,
 						 NULL);
 			return;
 		}
+#endif
 
 		fknsp = get_namespace_name(relid_dst);
 		fkrelname = relname_dst;

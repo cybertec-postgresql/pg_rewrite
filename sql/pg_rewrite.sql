@@ -92,7 +92,7 @@ TABLE tab4;
 
 -- One more test for "manual" validation of FKs, this time we rewrite the PK
 -- table. The NOT VALID constraint cannot be used if the FK table is
--- partitioned, so we need a separate test.
+-- partitioned and if PG version is < 18, so we need a separate test.
 CREATE TABLE tab1_pk(i int primary key);
 INSERT INTO tab1_pk(i) VALUES (1);
 CREATE TABLE tab1_pk_new(i bigint primary key);
