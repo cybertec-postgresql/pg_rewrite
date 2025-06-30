@@ -28,6 +28,13 @@ Following are the most common reasons to rewrite a table:
     data to a new table like in 2). Again, you may need `pg_rewrite` to make
     the change smooth.
 
+4.  Move table into another tablespace.
+
+    `ALTER TABLE` command can do that, but it allows neither write nor read
+    access to the table during the rewriting. With `pg_rewrite`, you only need
+    to create the new table in the desired tablespace. The rest is identical
+    to the other use cases.
+
 Note that the following use cases can be combined in a single rewrited.
 
 
