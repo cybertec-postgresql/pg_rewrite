@@ -1261,7 +1261,7 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 	if (conv_map)
 		free_conversion_map_ext(conv_map);
 
-	/* See the top of the function. */
+	/* See PushActiveSnapshot() above. */
 	PopActiveSnapshot();
 }
 
