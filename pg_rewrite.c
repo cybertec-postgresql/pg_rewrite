@@ -75,7 +75,11 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+#ifdef PG_MODULE_MAGIC_EXT
+PG_MODULE_MAGIC_EXT(.name = "pg_rewrite", .version = "1.2");
+#else
 PG_MODULE_MAGIC;
+#endif
 
 #define	REPL_SLOT_BASE_NAME	"pg_rewrite_slot_"
 #define	REPL_PLUGIN_NAME	"pg_rewrite"

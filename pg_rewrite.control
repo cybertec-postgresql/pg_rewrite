@@ -1,5 +1,5 @@
 # pg_rewrite extension
 comment = 'Tool for maintenance that requires table rewriting.'
-default_version = '1.3'
+default_version = '1.2'
 module_pathname = '$libdir/pg_rewrite'
 relocatable = true
