@@ -75,14 +75,14 @@ Referenced by:
     TABLE "tab1_fk" CONSTRAINT "tab1_fk_i_fkey2" FOREIGN KEY (i) REFERENCES tab1(i)
 Number of partitions: 4 (Use \d+ to list them.)
 
-EXPLAIN SELECT * FROM tab1;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
- Append  (cost=0.00..162.40 rows=8160 width=12)
-   ->  Seq Scan on tab1_new_part_1 tab1_1  (cost=0.00..30.40 rows=2040 width=12)
-   ->  Seq Scan on tab1_new_part_2 tab1_2  (cost=0.00..30.40 rows=2040 width=12)
-   ->  Seq Scan on tab1_new_part_3 tab1_3  (cost=0.00..30.40 rows=2040 width=12)
-   ->  Seq Scan on tab1_new_part_4 tab1_4  (cost=0.00..30.40 rows=2040 width=12)
+EXPLAIN (COSTS off) SELECT * FROM tab1;
+                QUERY PLAN                
+------------------------------------------
+ Append
+   ->  Seq Scan on tab1_new_part_1 tab1_1
+   ->  Seq Scan on tab1_new_part_2 tab1_2
+   ->  Seq Scan on tab1_new_part_3 tab1_3
+   ->  Seq Scan on tab1_new_part_4 tab1_4
 (5 rows)
 
 -- Check that the contents has not changed.
@@ -325,7 +325,6 @@ Foreign-key constraints:
     "tab1_fk_i_fkey" FOREIGN KEY (i) REFERENCES tab1_pk(i)
 
 SELECT rewrite_table('tab1_fk', 'tab1_fk_new', 'tab1_fk_orig');
-NOTICE:  FOREIGN KEY with NOT VALID option cannot be added to partitioned table
  rewrite_table 
 ---------------
  
@@ -339,6 +338,8 @@ NOTICE:  FOREIGN KEY with NOT VALID option cannot be added to partitioned table
 Partition key: RANGE (i)
 Indexes:
     "tab1_fk_new_pkey" PRIMARY KEY, btree (i)
+Foreign-key constraints:
+    "tab1_fk_i_fkey2" FOREIGN KEY (i) REFERENCES tab1_pk(i) NOT VALID
 Number of partitions: 1 (Use \d+ to list them.)
 
 -- Check if sequence on the target table is synchronized with that of the
