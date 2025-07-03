@@ -3,11 +3,13 @@ setup
     CREATE EXTENSION injection_points;
     CREATE EXTENSION pg_rewrite;
 
-    CREATE TABLE tbl_src(i int primary key, j int);
+    CREATE TABLE tbl_src(i int primary key, j int,
+			 k int generated always as (-j) virtual,
+			 l int generated always as (-j) stored);
     INSERT INTO tbl_src(i, j) VALUES (1, 10), (4, 40), (7, 70);
 
     -- Change of data type and column order.
-    CREATE TABLE tbl_dst(j int, i bigint primary key);
+    CREATE TABLE tbl_dst(j int, i bigint primary key, k int, l int);
 }
 
 teardown
@@ -40,7 +42,7 @@ step do_check
 {
     TABLE pg_rewrite_progress;
 
-    SELECT i, j FROM tbl_src ORDER BY i, j;
+    SELECT i, j, k, l FROM tbl_src ORDER BY i, j;
 }
 
 session s2

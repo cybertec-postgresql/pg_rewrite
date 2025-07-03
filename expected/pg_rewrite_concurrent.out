@@ -80,20 +80,20 @@ $$;
 step do_check: 
     TABLE pg_rewrite_progress;
 
-    SELECT i, j FROM tbl_src ORDER BY i, j;
+    SELECT i, j, k, l FROM tbl_src ORDER BY i, j;
 
 src_table|dst_table|src_table_new|ins_initial|ins|upd|del
 ---------+---------+-------------+-----------+---+---+---
 tbl_src  |tbl_dst  |tbl_src_old  |          3|  3|  4|  1
 (1 row)
 
-i| j
--+--
-1| 0
-2| 8
-3|30
-5|50
-6|40
+i| j|  k|  l
+-+--+---+---
+1| 0|  0|  0
+2| 8| -8| -8
+3|30|-30|-30
+5|50|-50|-50
+6|40|-40|-40
 (5 rows)
 
 step wakeup_after_commit_ip: 

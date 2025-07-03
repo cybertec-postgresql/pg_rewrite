@@ -59,6 +59,7 @@
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/standbydefs.h"
+#include "rewrite/rewriteHandler.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -156,12 +157,12 @@ static void close_partitions(partitions_hash *partitions);
 
 static AttrMapExt *make_attrmap_ext(int maplen);
 static void free_attrmap_ext(AttrMapExt *map);
-static TupleConversionMapExt *convert_tuples_by_name_ext(TupleDesc indesc,
-														 TupleDesc outdesc);
-static AttrMapExt *build_attrmap_by_name_if_req_ext(TupleDesc indesc,
-													TupleDesc outdesc);
-static AttrMapExt *build_attrmap_by_name_ext(TupleDesc indesc,
-											 TupleDesc outdesc);
+static TupleConversionMapExt *convert_tuples_by_name_ext(Relation rel_src,
+														 Relation rel_dst);
+static AttrMapExt *build_attrmap_by_name_if_req_ext(Relation rel_src,
+													Relation rel_dst);
+static AttrMapExt *build_attrmap_by_name_ext(Relation rel_src,
+											 Relation rel_dst);
 static bool check_attrmap_match_ext(TupleDesc indesc, TupleDesc outdesc,
 									AttrMapExt *attrMap);
 static TupleConversionMapExt *convert_tuples_by_name_attrmap_ext(TupleDesc indesc,
@@ -183,6 +184,7 @@ static void dump_constraint_common(const char *nsp, const char *relname,
 								   Form_pg_constraint con, StringInfo buf);
 static int decompile_column_index_array(Datum column_index_array, Oid relId,
 										StringInfo buf);
+static Node *build_generation_expression_ext(Relation rel, int attrno);
 
 /*
  * The maximum time to hold AccessExclusiveLock on the source table during the
@@ -994,13 +996,9 @@ rewrite_table_impl(char *relschema_src, char *relname_src,
 
 	/*
 	 * Create a conversion map so that we can handle difference(s) in the
-	 * tuple descriptor. Note that a copy is passed to 'indesc' since the map
-	 * contains a tuple slot based on this descriptor and since 'rel_src' will
-	 * be closed and re-opened (in order to acquire AccessExclusiveLock)
-	 * before the last use of 'conv_map'.
+	 * tuple descriptor.
 	 */
-	conv_map = convert_tuples_by_name_ext(CreateTupleDescCopy(RelationGetDescr(rel_src)),
-										  RelationGetDescr(rel_dst));
+	conv_map = convert_tuples_by_name_ext(rel_src, rel_dst);
 
 	/*
 	 * Are we going to route the data into partitions?
@@ -1403,9 +1401,7 @@ get_partitions(Relation rel_src, Relation rel_dst, int *nparts,
 		entry->slot_ind = table_slot_create(partition, NULL);
 		entry->slot =  MakeSingleTupleTableSlot(RelationGetDescr(rel_dst),
 												&TTSOpsHeapTuple);
-		entry->conv_map =
-			convert_tuples_by_name_ext(RelationGetDescr(rel_dst),
-									   RelationGetDescr(partition));
+		entry->conv_map = convert_tuples_by_name_ext(rel_src, rel_dst);
 		/* Expect many insertions. */
 		entry->bistate = GetBulkInsertState();
 
@@ -2579,7 +2575,8 @@ make_attrmap_ext(int maplen)
 	res->maplen = maplen;
 	res->attnums = (AttrNumber *) palloc0(sizeof(AttrNumber) * maplen);
 	res->dropped_attr = false;
-	res->coerceExprs = palloc0_array(Node *, maplen);
+	res->exprsIn = palloc0_array(Node *, maplen);
+	res->exprsOut = palloc0_array(Node *, maplen);
 	return res;
 }
 
@@ -2587,7 +2584,8 @@ static void
 free_attrmap_ext(AttrMapExt *map)
 {
 	pfree(map->attnums);
-	pfree(map->coerceExprs);
+	pfree(map->exprsIn);
+	pfree(map->exprsOut);
 	pfree(map);
 }
 
@@ -2596,13 +2594,14 @@ free_attrmap_ext(AttrMapExt *map)
  * and output types differ.
  */
 static TupleConversionMapExt *
-convert_tuples_by_name_ext(TupleDesc indesc,
-						   TupleDesc outdesc)
+convert_tuples_by_name_ext(Relation rel_src, Relation rel_dst)
 {
+	TupleDesc indesc = RelationGetDescr(rel_src);
+	TupleDesc outdesc = RelationGetDescr(rel_dst);
 	AttrMapExt    *attrMap;
 
 	/* Verify compatibility and prepare attribute-number map */
-	attrMap = build_attrmap_by_name_if_req_ext(indesc, outdesc);
+	attrMap = build_attrmap_by_name_if_req_ext(rel_src, rel_dst);
 
 	if (attrMap == NULL)
 	{
@@ -2618,13 +2617,14 @@ convert_tuples_by_name_ext(TupleDesc indesc,
  * input and output types differ.
  */
 static AttrMapExt *
-build_attrmap_by_name_if_req_ext(TupleDesc indesc,
-								 TupleDesc outdesc)
+build_attrmap_by_name_if_req_ext(Relation rel_src, Relation rel_dst)
 {
+	TupleDesc indesc = RelationGetDescr(rel_src);
+	TupleDesc outdesc = RelationGetDescr(rel_dst);
 	AttrMapExt    *attrMap;
 
 	/* Verify compatibility and prepare attribute-number map */
-	attrMap = build_attrmap_by_name_ext(indesc, outdesc);
+	attrMap = build_attrmap_by_name_ext(rel_src, rel_dst);
 
 	/*
 	 * Check if the map has a one-to-one match and if there's any coercion.
@@ -2644,14 +2644,16 @@ build_attrmap_by_name_if_req_ext(TupleDesc indesc,
  * output types differ.
  */
 static AttrMapExt *
-build_attrmap_by_name_ext(TupleDesc indesc,
-						  TupleDesc outdesc)
+build_attrmap_by_name_ext(Relation rel_src, Relation rel_dst)
 {
 	AttrMapExt    *attrMap;
 	int			outnatts;
 	int			innatts;
 	int			i;
 	int			nextindesc = -1;
+	ParseState *pstate = NULL;
+	TupleDesc indesc = RelationGetDescr(rel_src);
+	TupleDesc outdesc = RelationGetDescr(rel_dst);
 
 	outnatts = outdesc->natts;
 	innatts = indesc->natts;
@@ -2661,7 +2663,7 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 	{
 		Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
 		char	   *attname;
-		Oid			atttypid;
+		Oid			atttypid, attcol;
 		int32		atttypmod;
 		int			j;
 
@@ -2673,6 +2675,7 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 		attname = NameStr(outatt->attname);
 		atttypid = outatt->atttypid;
 		atttypmod = outatt->atttypmod;
+		attcol = outatt->attcollation;
 
 		/*
 		 * Now search for an attribute with the same name in the indesc. It
@@ -2701,12 +2704,55 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 			}
 			if (strcmp(attname, NameStr(inatt->attname)) == 0)
 			{
-				/* Found it, check type */
-				if (atttypid != inatt->atttypid || atttypmod != inatt->atttypmod)
-				{
-					Node	*expr;
-					ParseState *pstate = make_parsestate(NULL);
+				Node	*expr;
 
+				/*
+				 * Found it. Insert NULL into generated virtual columns, the
+				 * actual value will be computed during query execution.
+				 */
+				if (outatt->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+					attrMap->exprsOut[i] = (Node *) makeNullConst(atttypid,
+																  atttypmod,
+																  attcol);
+				else if (outatt->attgenerated == ATTRIBUTE_GENERATED_STORED)
+				{
+					/*
+					 * Initialize the expression to compute the stored value
+					 * of the column.
+					 *
+					 * This is redundant if the value in the input tuple
+					 * already has the correct value (typically because it's
+					 * generated by the same expression) but such conditions
+					 * are not trivial to check.
+					 */
+					expr = (Node *) build_generation_expression_ext(rel_dst,
+																	outatt->attnum);
+					if (expr == NULL)
+						/* This should not happen. */
+						ereport(ERROR,
+								(errcode(ERRCODE_DATATYPE_MISMATCH),
+								 errmsg("could not retrieve expression for attribute \"%s\" of relation \"%s\"",
+										attname, RelationGetRelationName(rel_dst))));
+					/*
+					 * coerce_to_target_type() is not needed here - the
+					 * expression should have been coerced before it was
+					 * stored in the catalog.
+					 */
+
+					if (pstate == NULL)
+						pstate = make_parsestate(NULL);
+					assign_expr_collations(pstate, expr);
+					attrMap->exprsOut[i] = expr;
+				}
+
+				/*
+				 * Check type. Also make sure that we have the expression to
+				 * generate the value of a virtual generated column.
+				 */
+				if (atttypid != inatt->atttypid ||
+					atttypmod != inatt->atttypmod ||
+					inatt->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+				{
 					/*
 					 * Can the input attribute be coerced to the output one?
 					 *
@@ -2717,6 +2763,8 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 											inatt->atttypid, inatt->atttypmod,
 											inatt->attcollation,
 											0);
+					if (pstate == NULL)
+						pstate = make_parsestate(NULL);
 					expr = coerce_to_target_type(pstate,
 												 expr, exprType(expr),
 												 outatt->atttypid,
@@ -2724,11 +2772,19 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 												 COERCION_ASSIGNMENT,
 												 COERCE_IMPLICIT_CAST,
 												 -1);
+					/* Here we take the column expression into account. */
+					if (inatt->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+						expr = expand_generated_columns_in_expr(expr, rel_src, 1);
+					/*
+					 * XXX Do we need to call expression_planner() like
+					 * ATPrepAlterColumnType() in PG core does?
+					 * ExecPrepareExpr() calls it before execution anyway.
+					 */
 
 					if (expr)
 					{
 						assign_expr_collations(pstate, expr);
-						attrMap->coerceExprs[i] = expr;
+						attrMap->exprsIn[i] = expr;
 					}
 					else
 						ereport(ERROR,
@@ -2739,6 +2795,10 @@ build_attrmap_by_name_ext(TupleDesc indesc,
 										   format_type_be(outdesc->tdtypeid),
 										   format_type_be(indesc->tdtypeid))));
 				}
+				/*
+				 * XXX Probably not needed if we set attrMap->exprs...[i]
+				 * above.
+				 */
 				attrMap->attnums[i] = inatt->attnum;
 				break;
 			}
@@ -2778,10 +2838,10 @@ check_attrmap_match_ext(TupleDesc indesc,
 	if (indesc->natts != outdesc->natts)
 		return false;
 
-	/* no match if there is at least one coercion expression */
+	/* no match if there is at least one expression. */
 	for (i = 0; i < attrMap->maplen; i++)
 	{
-		if (attrMap->coerceExprs[i])
+		if (attrMap->exprsIn[i] || attrMap->exprsOut[i])
 			return false;
 	}
 
@@ -2827,34 +2887,51 @@ convert_tuples_by_name_attrmap_ext(TupleDesc indesc,
 	int			n = outdesc->natts;
 	TupleConversionMapExt *map;
 	EState *estate;
+	bool	have_outer_expr = false;
 
 	Assert(attrMap != NULL);
 
 	/* Prepare the map structure */
-	map = (TupleConversionMapExt *) palloc(sizeof(TupleConversionMapExt));
+	map = (TupleConversionMapExt *) palloc0(sizeof(TupleConversionMapExt));
 	map->indesc = indesc;
 	map->outdesc = outdesc;
 	map->attrMap = attrMap;
 	/* preallocate workspace for Datum arrays */
-	map->outvalues = (Datum *) palloc(n * sizeof(Datum));
-	map->outisnull = (bool *) palloc(n * sizeof(bool));
 	n = indesc->natts + 1;		/* +1 for NULL */
 	map->invalues = (Datum *) palloc(n * sizeof(Datum));
 	map->inisnull = (bool *) palloc(n * sizeof(bool));
 	map->invalues[0] = (Datum) 0;	/* set up the NULL entry */
 	map->inisnull[0] = true;
 
-	map->coerceExprs = (ExprState **) palloc0_array(ExprState *, n);
+	map->exprsIn = (ExprState **) palloc0_array(ExprState *, indesc->natts);
 	estate = CreateExecutorState();
 	for (int i = 0; i < outdesc->natts; i++)
 	{
-		Expr	*expr = (Expr *) attrMap->coerceExprs[i];
+		Expr	*expr = (Expr *) attrMap->exprsIn[i];
 
 		if (expr)
-			map->coerceExprs[i] = ExecPrepareExpr(expr, estate);
+			map->exprsIn[i] = ExecPrepareExpr(expr, estate);
+
+		if (attrMap->exprsOut[i])
+			have_outer_expr = true;
+	}
+	if (have_outer_expr)
+	{
+		Assert(indesc->natts == outdesc->natts);
+
+		map->exprsOut = (ExprState **) palloc0_array(ExprState *,
+													 outdesc->natts);
+		for (int i = 0; i < outdesc->natts; i++)
+		{
+			Expr	*expr = (Expr *) attrMap->exprsOut[i];
+
+			if (expr)
+				map->exprsOut[i] = ExecPrepareExpr(expr, estate);
+		}
 	}
 	map->estate = estate;
 	map->in_slot = MakeSingleTupleTableSlot(indesc, &TTSOpsHeapTuple);
+	map->out_slot = MakeSingleTupleTableSlot(outdesc, &TTSOpsVirtual);
 
 	return map;
 }
@@ -2869,8 +2946,8 @@ pg_rewrite_execute_attr_map_tuple(HeapTuple tuple, TupleConversionMapExt *map)
 	AttrMapExt    *attrMap = map->attrMap;
 	Datum	   *invalues = map->invalues;
 	bool	   *inisnull = map->inisnull;
-	Datum	   *outvalues = map->outvalues;
-	bool	   *outisnull = map->outisnull;
+	Datum	   *outvalues = map->out_slot->tts_values;
+	bool	   *outisnull = map->out_slot->tts_isnull;
 	int			i;
 	ExprContext *ecxt;
 
@@ -2881,12 +2958,14 @@ pg_rewrite_execute_attr_map_tuple(HeapTuple tuple, TupleConversionMapExt *map)
 	 */
 	heap_deform_tuple(tuple, map->indesc, invalues + 1, inisnull + 1);
 
-	/* Prepare for evaluation of coercion expressions. */
+	/* Prepare for evaluation of expressions. */
 	ResetPerTupleExprContext(map->estate);
 	ecxt = GetPerTupleExprContext(map->estate);
 	ExecClearTuple(map->in_slot);
 	ExecStoreHeapTuple(tuple, map->in_slot, false);
 	ecxt->ecxt_scantuple = map->in_slot;
+	if (map->out_slot)
+		ExecClearTuple(map->out_slot);
 
 	/*
 	 * Transpose into proper fields of the new tuple.
@@ -2895,9 +2974,9 @@ pg_rewrite_execute_attr_map_tuple(HeapTuple tuple, TupleConversionMapExt *map)
 	for (i = 0; i < attrMap->maplen; i++)
 	{
 		int			j = attrMap->attnums[i];
-		ExprState	*coerceExpr = map->coerceExprs[i];
+		ExprState	*expr = map->exprsIn[i];
 
-		if (coerceExpr == NULL)
+		if (expr == NULL)
 		{
 			/* Simply copy the value. */
 			outvalues[i] = invalues[j];
@@ -2905,14 +2984,45 @@ pg_rewrite_execute_attr_map_tuple(HeapTuple tuple, TupleConversionMapExt *map)
 		}
 		else
 		{
-			/* Perform the coercion. */
-			outvalues[i] = ExecEvalExprSwitchContext(coerceExpr, ecxt,
+			/* Generated column - evaluate the expression.. */
+			outvalues[i] = ExecEvalExprSwitchContext(expr, ecxt,
 													 &outisnull[i]);
 		}
 	}
 
 	/*
-	 * Now form the new tuple.
+	 * Compute values of the ATTRIBUTE_GENERATED_STORED attributes in the
+	 * output tuple if there are some.
+	 */
+	if (map->exprsOut)
+	{
+		/*
+		 * The values are already in the slot's tts_values/tts_isnull arrays
+		 * because outvalues/outisnull are just pointers to these.
+		 */
+		ExecStoreVirtualTuple(map->out_slot);
+
+		ecxt->ecxt_scantuple = map->out_slot;
+
+		for (i = 0; i < attrMap->maplen; i++)
+		{
+			ExprState	*expr = map->exprsOut[i];
+
+			/*
+			 * As noted in build_attrmap_by_name_ext(), the value may already
+			 * be correct if the same expression was used to generate (and
+			 * store) the it in the source table. However it's easier to
+			 * compute it again than to compare the expression. (Different
+			 * order of attributes can make the comparison tricky.)
+			 */
+			if (expr)
+				outvalues[i] = ExecEvalExprSwitchContext(expr, ecxt,
+														 &outisnull[i]);
+		}
+	}
+
+	/*
+	 * Form and return the new tuple.
 	 */
 	return heap_form_tuple(map->outdesc, outvalues, outisnull);
 }
@@ -2928,10 +3038,9 @@ free_conversion_map_ext(TupleConversionMapExt *map)
 	free_attrmap_ext(map->attrMap);
 	pfree(map->invalues);
 	pfree(map->inisnull);
-	pfree(map->outvalues);
-	pfree(map->outisnull);
 	FreeExecutorState(map->estate);
 	ExecDropSingleTupleTableSlot(map->in_slot);
+	ExecDropSingleTupleTableSlot(map->out_slot);
 	pfree(map);
 }
 
@@ -3597,4 +3706,46 @@ decompile_column_index_array(Datum column_index_array, Oid relId,
 	}
 
 	return nKeys;
+}
+
+/*
+ * Like build_generation_expression() in PG core but no assertions about
+ * virtual columns.
+ */
+static Node *
+build_generation_expression_ext(Relation rel, int attrno)
+{
+	TupleDesc	rd_att = RelationGetDescr(rel);
+	Form_pg_attribute att_tup = TupleDescAttr(rd_att, attrno - 1);
+	Node	   *defexpr;
+	Oid			attcollid;
+
+	/*
+	 * Assert(rd_att->constr && rd_att->constr->has_generated_virtual);
+	 * Assert(att_tup->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL);
+	 */
+
+	defexpr = build_column_default(rel, attrno);
+	if (defexpr == NULL)
+		elog(ERROR, "no generation expression found for column number %d of table \"%s\"",
+			 attrno, RelationGetRelationName(rel));
+
+	/*
+	 * If the column definition has a collation and it is different from the
+	 * collation of the generation expression, put a COLLATE clause around the
+	 * expression.
+	 */
+	attcollid = att_tup->attcollation;
+	if (attcollid && attcollid != exprCollation(defexpr))
+	{
+		CollateExpr *ce = makeNode(CollateExpr);
+
+		ce->arg = (Expr *) defexpr;
+		ce->collOid = attcollid;
+		ce->location = -1;
+
+		defexpr = (Node *) ce;
+	}
+
+	return defexpr;
 }

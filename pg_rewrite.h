@@ -168,9 +168,15 @@ typedef struct AttrMapExt
 	int			maplen;
 	bool	dropped_attr;	/* Has outer or inner descriptor a dropped
 							 * attribute? */
-	Node	**coerceExprs;	/* Non-NULL field tells how to convert the input
-							 * value to the output data type. NULL indicates
-							 * that no conversion is needed. */
+	Node	**exprsIn;		/* Non-NULL field tells how to convert the input
+							 * value to the output data type and/or to
+							 * evaluate the column expression. NULL indicates
+							 * that no conversion is needed and that there is
+							 * no expression for given column. */
+	Node	**exprsOut;		/*
+							 * Likewise, expression to compute the value of an
+							 * output column.
+							 */
 } AttrMapExt;
 
 /*
@@ -185,13 +191,13 @@ typedef struct TupleConversionMapExt
 	AttrMapExt    *attrMap;		/* indexes of input fields, or 0 for null */
 	Datum	   *invalues;		/* workspace for deconstructing source */
 	bool	   *inisnull;
-	Datum	   *outvalues;		/* workspace for constructing result */
-	bool	   *outisnull;
-	ExprState	**coerceExprs;	/* See AttrMapExt */
+	ExprState	**exprsIn;		/* See AttrMapExt */
+	ExprState	**exprsOut;		/* See AttrMapExt */
 	EState		*estate;		/* Executor state used to evaluate
 								 * coerceExprs. */
 	TupleTableSlot *in_slot;	/* Slot to store the input tuple for
 								 * coercion. */
+	TupleTableSlot *out_slot;	/* Slot to construct the output tuple. */
 } TupleConversionMapExt;
 
 /*
