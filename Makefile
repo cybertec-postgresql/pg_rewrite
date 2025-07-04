@@ -8,7 +8,8 @@ DATA = pg_rewrite--1.0.sql pg_rewrite--1.0--1.1.sql pg_rewrite--1.1--1.2.sql
 DOCS = pg_rewrite.md
 
 REGRESS = pg_rewrite generated
-#ISOLATION = pg_rewrite_concurrent pg_rewrite_concurrent_partition
+#ISOLATION = pg_rewrite_concurrent pg_rewrite_concurrent_partition \
+pg_rewrite_concurrent_toast
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

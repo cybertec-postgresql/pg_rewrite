@@ -1,0 +1,109 @@
+Parsed test spec with 2 sessions
+
+starting permutation: do_rewrite wait_for_before_lock_ip do_changes wakeup_before_lock_ip wait_for_after_commit_ip do_check wakeup_after_commit_ip
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step do_rewrite: 
+    SELECT rewrite_table_nowait('tbl_src', 'tbl_dst', 'tbl_src_old');
+
+rewrite_table_nowait
+--------------------
+                    
+(1 row)
+
+step wait_for_before_lock_ip: 
+DO $$
+BEGIN
+        LOOP
+		PERFORM pg_stat_clear_snapshot();
+
+	        PERFORM
+		FROM pg_stat_activity
+		WHERE (wait_event_type, wait_event)=('InjectionPoint', 'pg_rewrite-before-lock');
+
+		IF FOUND THEN
+			EXIT;
+		END IF;
+
+		PERFORM pg_sleep(.1);
+	END LOOP;
+END;
+$$;
+
+step do_changes: 
+    INSERT INTO tbl_src(i, t)
+    SELECT 5, string_agg(random()::text, '')
+    FROM generate_series(1, 200) h(y);
+
+    UPDATE tbl_src SET t = t || 'x' WHERE i = 1;
+
+step wakeup_before_lock_ip: 
+    SELECT injection_points_wakeup('pg_rewrite-before-lock');
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step wait_for_after_commit_ip: 
+DO $$
+BEGIN
+        LOOP
+		PERFORM pg_stat_clear_snapshot();
+
+	        PERFORM
+		FROM pg_stat_activity
+		WHERE (wait_event_type, wait_event)=('InjectionPoint', 'pg_rewrite-after-commit');
+
+		IF FOUND THEN
+			EXIT;
+		END IF;
+
+		PERFORM pg_sleep(.1);
+	END LOOP;
+END;
+$$;
+
+step do_check: 
+    TABLE pg_rewrite_progress;
+
+    -- Each row should contain TOASTed value.
+    SELECT count(*) FROM tbl_src WHERE pg_column_toast_chunk_id(t) ISNULL;
+
+    -- The contents of the new table should be identical to that of the old
+    -- one.
+    SELECT count(*)
+    FROM tbl_src t1 JOIN tbl_src_old t2 ON t1.i = t2.i
+    WHERE t1.t <> t2.t;
+
+src_table|dst_table|src_table_new|ins_initial|ins|upd|del
+---------+---------+-------------+-----------+---+---+---
+tbl_src  |tbl_dst  |tbl_src_old  |          2|  1|  1|  0
+(1 row)
+
+count
+-----
+    0
+(1 row)
+
+count
+-----
+    0
+(1 row)
+
+step wakeup_after_commit_ip: 
+    SELECT injection_points_wakeup('pg_rewrite-after-commit');
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
