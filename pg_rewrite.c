@@ -1401,7 +1401,7 @@ get_partitions(Relation rel_src, Relation rel_dst, int *nparts,
 		entry->slot_ind = table_slot_create(partition, NULL);
 		entry->slot =  MakeSingleTupleTableSlot(RelationGetDescr(rel_dst),
 												&TTSOpsHeapTuple);
-		entry->conv_map = convert_tuples_by_name_ext(rel_src, rel_dst);
+		entry->conv_map = convert_tuples_by_name_ext(rel_dst, partition);
 		/* Expect many insertions. */
 		entry->bistate = GetBulkInsertState();
 
