@@ -2663,7 +2663,10 @@ build_attrmap_by_name_ext(Relation rel_src, Relation rel_dst)
 	{
 		Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
 		char	   *attname;
-		Oid			atttypid, attcol;
+		Oid			atttypid;
+#if PG_VERSION_NUM >= 180000
+		Oid			attcol;
+#endif
 		int32		atttypmod;
 		int			j;
 
@@ -2675,7 +2678,9 @@ build_attrmap_by_name_ext(Relation rel_src, Relation rel_dst)
 		attname = NameStr(outatt->attname);
 		atttypid = outatt->atttypid;
 		atttypmod = outatt->atttypmod;
+#if PG_VERSION_NUM >= 180000
 		attcol = outatt->attcollation;
+#endif
 
 		/*
 		 * Now search for an attribute with the same name in the indesc. It
@@ -2710,11 +2715,7 @@ build_attrmap_by_name_ext(Relation rel_src, Relation rel_dst)
 				 * Found it. Insert NULL into generated virtual columns, the
 				 * actual value will be computed during query execution.
 				 */
-				if (outatt->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
-					attrMap->exprsOut[i] = (Node *) makeNullConst(atttypid,
-																  atttypmod,
-																  attcol);
-				else if (outatt->attgenerated == ATTRIBUTE_GENERATED_STORED)
+				if (outatt->attgenerated == ATTRIBUTE_GENERATED_STORED)
 				{
 					/*
 					 * Initialize the expression to compute the stored value
@@ -2744,14 +2745,23 @@ build_attrmap_by_name_ext(Relation rel_src, Relation rel_dst)
 					assign_expr_collations(pstate, expr);
 					attrMap->exprsOut[i] = expr;
 				}
+#if PG_VERSION_NUM >= 180000
+				else if (outatt->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+					attrMap->exprsOut[i] = (Node *) makeNullConst(atttypid,
+																  atttypmod,
+																  attcol);
+#endif
 
 				/*
 				 * Check type. Also make sure that we have the expression to
 				 * generate the value of a virtual generated column.
 				 */
 				if (atttypid != inatt->atttypid ||
-					atttypmod != inatt->atttypmod ||
-					inatt->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+					atttypmod != inatt->atttypmod
+#if PG_VERSION_NUM >= 180000
+					|| inatt->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL
+#endif
+					)
 				{
 					/*
 					 * Can the input attribute be coerced to the output one?
@@ -2772,9 +2782,11 @@ build_attrmap_by_name_ext(Relation rel_src, Relation rel_dst)
 												 COERCION_ASSIGNMENT,
 												 COERCE_IMPLICIT_CAST,
 												 -1);
+#if PG_VERSION_NUM >= 180000
 					/* Here we take the column expression into account. */
 					if (inatt->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 						expr = expand_generated_columns_in_expr(expr, rel_src, 1);
+#endif
 					/*
 					 * XXX Do we need to call expression_planner() like
 					 * ATPrepAlterColumnType() in PG core does?

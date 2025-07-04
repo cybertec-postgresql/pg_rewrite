@@ -7,7 +7,7 @@ EXTENSION = pg_rewrite
 DATA = pg_rewrite--1.0.sql pg_rewrite--1.0--1.1.sql pg_rewrite--1.1--1.2.sql
 DOCS = pg_rewrite.md
 
-REGRESS = pg_rewrite
+REGRESS = pg_rewrite generated
 #ISOLATION = pg_rewrite_concurrent pg_rewrite_concurrent_partition
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)

@@ -150,30 +150,3 @@ INSERT INTO tab6(i) VALUES (DEFAULT);
 SELECT rewrite_table('tab6', 'tab6_new', 'tab6_orig');
 INSERT INTO tab6(i) VALUES (DEFAULT);
 SELECT i FROM tab6 ORDER BY i;
-
--- Generated columns - some meaningful combinations of source and destination
--- columns.
-CREATE TABLE tab7(
-        i int primary key,
-	j int,
-	k int generated always as (i + 1) virtual,
-	l int generated always AS (i + 1) virtual);
-CREATE TABLE tab7_new(
-        i int primary key,
-        -- Override the value copied from the source table.
-        j int generated always AS (i - 1) stored,
-	-- Check that the expression is evaluated correctly on the source
-	-- table.
-	k int,
-	-- Override the value computed on the source table.
-	l int generated always as (i - 1) virtual);
-INSERT INTO tab7(i, j) VALUES (1, 1);
-SELECT rewrite_table('tab7', 'tab7_new', 'tab7_orig');
-SELECT * FROM tab7 ORDER BY i;
-
-CREATE EXTENSION pageinspect;
--- HEAP_HASNULL indicates that the value of 'l' hasn't been copied from the
--- source table.
-SELECT raw_flags
-FROM heap_page_items(get_raw_page('tab7', 0)),
-LATERAL heap_tuple_infomask_flags(t_infomask, t_infomask2);
