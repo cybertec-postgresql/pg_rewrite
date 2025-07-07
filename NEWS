@@ -1,3 +1,25 @@
+Release 1.2
+===========
+
+1.  This release makes the extension useful in more use cases.
+
+    Besides turning a non-partitioned table into a partitioned one, it can be
+    used to change 1) data type of column(s), 2) order of columns, 3)
+    tablespace.
+
+2.  A single function `rewrite_table()` is used now to handle all the use
+    cases.
+
+3.  Constraints are handled in a more convenient way.
+
+    The extension now takes care of creating the constrains on the target
+    table according to the source table. The user only needs to validate the
+    constrants after the rewriting has finished.
+
+    Unlike the previous release, the rewritten table can be referenced by
+    foreign key constraints.
+
+
 Release 1.1.1
 =============
 

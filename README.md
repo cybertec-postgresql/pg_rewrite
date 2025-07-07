@@ -126,7 +126,7 @@ well as a new table name for the source table. For example:
 SELECT rewrite_table('measurement', 'measurement_aux', 'measurement_old');
 ```
 
-The call will first copy all rows from `measurement` to `measurement_aux`. The
+The call will first copy all rows from `measurement` to `measurement_aux`. Then
 it will apply to `measurement_aux` all the data changes (INSERT, UPDATE,
 DELETE) that took place in `measurement` during the copying. Next, it will
 lock `measurement` so that neither read nor write access is possible. Finally
@@ -215,8 +215,15 @@ incorporated into the partitioned table, otherwise they'd get lost.)
 
 # Limitations
 
-If the target table is partitioned, it's not allowed to have foreign
-tables as partitions.
+1.  If the target table is partitioned, it's not allowed to have foreign
+    tables as partitions.
+
+2.  Indexes are not renamed.
+
+    While the target table (`measurement_aux` above) is renamed to the source
+    table (`measurement`), its indexes are not renamed to match the source
+    table. If you consider it a problem, please use the `ALTER INDEX` command
+    to rename them. This operation blocks neither reads nor writes.
 
 # Configuration
 
