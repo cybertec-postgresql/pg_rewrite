@@ -12,7 +12,7 @@ Release 1.2
 
 3.  Constraints are handled in a more convenient way.
 
-    The extension now takes care of creating the constrains on the target
+    The extension now takes care of creating the constraints on the target
     table according to the source table. The user only needs to validate the
     constrants after the rewriting has finished.
 
