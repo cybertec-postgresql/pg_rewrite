@@ -140,8 +140,8 @@ exist between the two types.
 
 # Constraints
 
-The target table should obviously end up with same constraints as the source
-table. It's recommended to handle constraints creation this way:
+The target table should obviously end up with the same constraints as the
+source table. It's recommended to handle constraints creation this way:
 
 1.  Add PRIMARY KEY, UNIQUE and EXCLUDE constraints of the source table to the
     target table before you call `rewrite_table()`. These are enforced during

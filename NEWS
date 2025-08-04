@@ -19,6 +19,11 @@ Release 1.2
     Unlike the previous release, the rewritten table can be referenced by
     foreign key constraints.
 
+    Note: The `rewrite.check_constraints` configuration variable was
+    removed. If there is a risk that other users could run `ALTER TABLE` on
+    the table during rewriting, please revoke the corresponding privileges
+    from them temporarily.
+
 
 Release 1.1.1
 =============
