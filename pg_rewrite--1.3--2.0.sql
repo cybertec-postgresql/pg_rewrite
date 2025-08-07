@@ -3,6 +3,7 @@
 -- complain if script is sourced in psql, rather than via ALTER EXTENSION
 \echo Use "ALTER EXTENSION pg_rewrite UPDATE TO '2.0'" to load this file. \quit
 
+DROP FUNCTION IF EXISTS rewrite_table_nowait;
 CREATE FUNCTION rewrite_table_nowait(
        src_table	text,
        dst_table	text,
