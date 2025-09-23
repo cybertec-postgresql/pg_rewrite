@@ -14,7 +14,7 @@ Release 2.0
 
     The extension now takes care of creating the constraints on the target
     table according to the source table. The user only needs to validate the
-    constrants after the rewriting has finished.
+    constraints after the rewriting has finished.
 
     Unlike the previous release, the rewritten table can be referenced by
     foreign key constraints.
