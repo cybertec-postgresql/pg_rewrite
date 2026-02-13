@@ -77,7 +77,7 @@
 #include "utils/varlena.h"
 
 #ifdef PG_MODULE_MAGIC_EXT
-PG_MODULE_MAGIC_EXT(.name = "pg_rewrite", .version = "2.0");
+PG_MODULE_MAGIC_EXT(.name = "pg_rewrite", .version = "2.1");
 #else
 PG_MODULE_MAGIC;
 #endif
@@ -179,6 +179,7 @@ static void dump_check_constraint(Oid relid_dst, const char *relname_dst,
 #if PG_VERSION_NUM >= 180000
 static void dump_null_constraint(Oid relid_dst, const char *relname_dst,
 								 HeapTuple tup, StringInfo buf);
+static bool is_notnull_in_pk(Form_pg_constraint notnull, Oid relid);
 #endif
 static void dump_constraint_common(const char *nsp, const char *relname,
 								   Form_pg_constraint con, StringInfo buf);
@@ -3327,7 +3328,12 @@ copy_constraints(Oid relid_dst, const char *relname_dst, Oid relid_src)
 #if PG_VERSION_NUM >= 180000
 			case CONSTRAINT_NOTNULL:
 				{
-					if (con->conrelid == relid_src)
+					/*
+					 * Do not create NOT NULL constraint if it should already
+					 * exist due to primary key constraint.
+					 */
+					if (con->conrelid == relid_src &&
+						!is_notnull_in_pk(con, relid_src))
 						dump_null_constraint(relid_dst, relname_dst, tuple,
 											 buf);
 					break;
@@ -3654,6 +3660,25 @@ dump_null_constraint(Oid relid_dst, const char *relname_dst,
 	if (((Form_pg_constraint) GETSTRUCT(tup))->connoinherit)
 		appendStringInfoString(buf, " NO INHERIT");
 
+}
+
+/*
+ * Should NOT NULL constraint have already been created due to PK of table
+ * specified by 'relid'?
+ */
+static bool
+is_notnull_in_pk(Form_pg_constraint notnull, Oid relid)
+{
+	Bitmapset	*notnull_attnos, *pk_attnos;
+	Oid		notnullid, pkoid;
+
+	notnull_attnos = get_relation_constraint_attnos(relid,
+													NameStr(notnull->conname),
+													false, &notnullid);
+	Assert(bms_num_members(notnull_attnos) == 1);
+	pk_attnos = get_primary_key_attnos(relid, true, &pkoid);
+
+	return bms_overlap(notnull_attnos, pk_attnos);
 }
 #endif
 

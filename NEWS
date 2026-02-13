@@ -1,3 +1,17 @@
+Release 2.1
+===========
+
+1. Do not try to create NOT NULL constraint unnecessarily.
+
+NOT NULL constraint is automatically created for columns involved in PRIMARY
+KEY constraint. Thus if the old table has a NOT NULL constraint in the
+catalog, we should only create it on the new table if the related column is
+not part of primary key.
+
+While this unnecessary ALTER TABLE ... ADD CONSTRAINT ... NOT NULL command
+used to be ignored silently so far, it causes ERROR since PostgreSQL 18.2.
+
+
 Release 2.0
 ===========
 

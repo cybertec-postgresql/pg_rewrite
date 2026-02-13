@@ -154,7 +154,7 @@ source table. It's recommended to handle constraints creation this way:
     constraints of the source table to the target table. `rewrite_table()`
     by-passes validation of these, but all the rows it inserts into the target
     table must have been validated in the source table. Even if the column
-    data tape is different in the target table, the data type conversion
+    data type is different in the target table, the data type conversion
     should not turn non-NULL value to NULL or vice versa.
 
 3.  CHECK constraints are created automatically by `rewrite_table()`
