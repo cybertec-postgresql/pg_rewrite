@@ -86,6 +86,45 @@ PG_MODULE_MAGIC;
 #define	REPL_PLUGIN_NAME	"pg_rewrite"
 
 /*
+ * PostgreSQL 19 no longer exports the replorigin_session_origin global
+ * variable -- the session origin must now be established via
+ * replorigin_session_setup() / replorigin_session_reset(), and there is no
+ * public accessor to read the value back. Track the value we set up
+ * ourselves and drive the actual session state through those functions, so
+ * that the rest of the code can keep referring to a single "current session
+ * origin" the way it did on older server versions.
+ */
+#if PG_VERSION_NUM >= 190000
+static RepOriginId pg_rewrite_session_origin = InvalidRepOriginId;
+
+static inline void
+pg_rewrite_session_origin_setup(RepOriginId origin)
+{
+	replorigin_session_setup(origin, 0);
+	pg_rewrite_session_origin = origin;
+}
+
+static inline void
+pg_rewrite_session_origin_reset(void)
+{
+	if (pg_rewrite_session_origin != InvalidRepOriginId)
+	{
+		replorigin_session_reset();
+		pg_rewrite_session_origin = InvalidRepOriginId;
+	}
+}
+#else
+#define pg_rewrite_session_origin	replorigin_session_origin
+#define pg_rewrite_session_origin_setup(origin) \
+	(replorigin_session_origin = (origin))
+#define pg_rewrite_session_origin_reset() \
+	do { \
+		if (replorigin_session_origin != InvalidRepOriginId) \
+			replorigin_session_origin = InvalidRepOriginId; \
+	} while (0)
+#endif
+
+/*
  * Information needed to set sequences belonging the destination table
  * according to the corresponding sequences of the source table.
  */
@@ -828,8 +867,7 @@ rewrite_worker_main(Datum main_arg)
 		 * do it here.  The insertion into the ReplicationOriginRelationId
 		 * catalog will be rolled back due to the transaction abort.
 		 */
-		if (replorigin_session_origin != InvalidRepOriginId)
-			replorigin_session_origin = InvalidRepOriginId;
+		pg_rewrite_session_origin_reset();
 
 		AbortOutOfAnyTransaction();
 
@@ -867,8 +905,7 @@ pg_rewrite_exit_if_requested(void)
 	 * The insertion into the ReplicationOriginRelationId catalog will be
 	 * rolled back due to the transaction abort.
 	 */
-	if (replorigin_session_origin != InvalidRepOriginId)
-		replorigin_session_origin = InvalidRepOriginId;
+	pg_rewrite_session_origin_reset();
 
 	/*
 	 * Message similar to that in ProcessInterrupts(), but ERROR is
@@ -1703,7 +1740,17 @@ setup_decoding(Relation rel)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser or replication role to use replication slots"))));
 
+#if PG_VERSION_NUM >= 190000
+	/*
+	 * Pass repack=false: pg_rewrite is a third-party tool built on the same
+	 * infrastructure as the core REPACK command, but it is not that
+	 * command, so it should not draw from the (possibly zero-sized)
+	 * max_repack_replication_slots quota reserved for REPACK itself.
+	 */
+	CheckLogicalDecodingRequirements(false);
+#else
 	CheckLogicalDecodingRequirements();
+#endif
 
 	/* Make sure there's no conflict with the SPI and its contexts. */
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
@@ -1715,7 +1762,9 @@ setup_decoding(Relation rel)
 	buf = makeStringInfo();
 	appendStringInfoString(buf, REPL_SLOT_BASE_NAME);
 	appendStringInfo(buf, "%u_%u", MyDatabaseId, relid);
-#if PG_VERSION_NUM >= 170000
+#if PG_VERSION_NUM >= 190000
+	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false, false, false, false);
+#elif PG_VERSION_NUM >= 170000
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false, false, false);
 #elif PG_VERSION_NUM >= 140000
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false);
@@ -1735,6 +1784,10 @@ setup_decoding(Relation rel)
 	ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME,
 									NIL,
 									true,
+#if PG_VERSION_NUM >= 190000
+									false,	/* for_repack, see the comment
+											 * above CheckLogicalDecodingRequirements() */
+#endif
 									InvalidXLogRecPtr,
 									XL_ROUTINE(.page_read = read_local_xlog_page,
 											   .segment_open = wal_segment_open,
@@ -1917,19 +1970,23 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 	 * The session origin will be used to mark WAL records produced by the
 	 * load itself so that they are not decoded.
 	 */
-	Assert(replorigin_session_origin == InvalidRepOriginId);
+	Assert(pg_rewrite_session_origin == InvalidRepOriginId);
 	snprintf(replorigin_name, sizeof(replorigin_name),
 			 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
-	replorigin_session_origin = replorigin_create(replorigin_name);
+	pg_rewrite_session_origin_setup(replorigin_create(replorigin_name));
 
 	/*
 	 * Also remember that the WAL records created during the load should not
 	 * be decoded later.
 	 */
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
-	dstate->rorigin = replorigin_session_origin;
+	dstate->rorigin = pg_rewrite_session_origin;
 
+#if PG_VERSION_NUM >= 190000
+	heap_scan = table_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL, SO_NONE);
+#else
 	heap_scan = table_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL);
+#endif
 
 	/* Slot to retrieve data from the source table. */
 	slot_src = table_slot_create(rel_src, NULL);
@@ -2219,6 +2276,15 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 #endif
 
 			/* Update indexes. */
+#if PG_VERSION_NUM >= 190000
+			recheck = ExecInsertIndexTuples(rri,
+											estate,
+											EIIT_NO_DUPE_ERROR,	/* flags */
+											slot_dst,
+											NIL,	/* arbiterIndexes */
+											NULL	/* specConflict */
+				);
+#else
 			recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 											rri,
@@ -2235,6 +2301,7 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 											, false /* onlySummarizing */
 #endif
 				);
+#endif
 			ExecClearTuple(slot_dst);
 
 			/*
@@ -2302,9 +2369,9 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 #if PG_VERSION_NUM >= 140000
 	replorigin_drop_by_name(replorigin_name, false, true);
 #else
-	replorigin_drop(replorigin_session_origin, false);
+	replorigin_drop(pg_rewrite_session_origin, false);
 #endif
-	replorigin_session_origin = InvalidRepOriginId;
+	pg_rewrite_session_origin_reset();
 
 	MemoryContextSwitchTo(old_cxt);
 	MemoryContextDelete(load_cxt);

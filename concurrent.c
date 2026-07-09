@@ -445,6 +445,15 @@ apply_insert(HeapTuple tup, TupleTableSlot *slot,
 	estate->es_result_relation_info = rri;
 #endif
 	/* Update indexes. */
+#if PG_VERSION_NUM >= 190000
+	recheck = ExecInsertIndexTuples(rri,
+									estate,
+									EIIT_NO_DUPE_ERROR,	/* flags */
+									slot,
+									NIL,	/* arbiterIndexes */
+									NULL	/* specConflict */
+		);
+#else
 	recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 		rri,
@@ -461,6 +470,7 @@ apply_insert(HeapTuple tup, TupleTableSlot *slot,
 		, false /* onlySummarizing */
 #endif
 		);
+#endif
 	ExecClearTuple(slot);
 
 	pfree(tup);
@@ -564,6 +574,15 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 		estate->es_result_relation_info = rri;
 #endif
 		/* Update indexes. */
+#if PG_VERSION_NUM >= 190000
+		recheck = ExecInsertIndexTuples(rri,
+										estate,
+										EIIT_NO_DUPE_ERROR,	/* flags */
+										entry->slot,
+										NIL,	/* arbiterIndexes */
+										NULL	/* specConflict */
+			);
+#else
 		recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 			rri,
@@ -580,6 +599,7 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 			, false /* onlySummarizing */
 #endif
 			);
+#endif
 		ExecClearTuple(entry->slot);
 
 		/* Update the progress information. */
@@ -653,6 +673,16 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 				 * es_range_table to be initialized. Is it worth the
 				 * complexity?
 				 */
+#if PG_VERSION_NUM >= 190000
+				recheck = ExecInsertIndexTuples(rri,
+												estate,
+												(update_indexes == TU_Summarizing) ?
+												EIIT_ONLY_SUMMARIZING : 0,	/* flags */
+												slot,
+												NIL,	/* arbiterIndexes */
+												NULL	/* specConflict */
+					);
+#else
 				recheck = ExecInsertIndexTuples(
 #if PG_VERSION_NUM >= 140000
 					rri,
@@ -670,6 +700,7 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 					, update_indexes == TU_Summarizing
 #endif
 					);
+#endif
 				ExecClearTuple(slot);
 				list_free(recheck);
 			}
@@ -756,7 +787,11 @@ find_tuple(HeapTuple tup, Relation rel, Relation ident_index, ScanKey key,
 #if PG_VERSION_NUM >= 180000
 						   NULL, /* instrument */
 #endif
-						   nkeys, 0);
+						   nkeys, 0
+#if PG_VERSION_NUM >= 190000
+						   , SO_NONE	/* flags */
+#endif
+		);
 	index_rescan(scan, key, nkeys, NULL, 0);
 
 	/* Use the incoming tuple to finalize the scan key. */
@@ -828,7 +863,11 @@ convert_tuple_for_dest_table(HeapTuple tuple,
 void
 _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
+#if PG_VERSION_NUM >= 190000
+	StaticAssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
+#else
 	AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
+#endif
 
 	cb->startup_cb = plugin_startup;
 	cb->begin_cb = plugin_begin_txn;

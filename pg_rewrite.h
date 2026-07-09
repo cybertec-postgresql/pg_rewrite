@@ -29,6 +29,18 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 
+/*
+ * PostgreSQL 19 unified the naming of the replication-origin identifiers
+ * and renamed RepOriginId to ReplOriginId (and InvalidRepOriginId to
+ * InvalidReplOriginId), see commit 1fdbca159e. Keep using the old names
+ * throughout this extension and let the preprocessor map them to whatever
+ * the server headers actually provide.
+ */
+#if PG_VERSION_NUM >= 190000
+#define RepOriginId			ReplOriginId
+#define InvalidRepOriginId	InvalidReplOriginId
+#endif
+
 typedef struct DecodingOutputState
 {
 	/* The relation whose changes we're decoding. */
