@@ -9,8 +9,8 @@
  */
 #include "pg_rewrite.h"
 
-#if PG_VERSION_NUM < 130000
-#error "PostgreSQL version 13 or higher is required"
+#if PG_VERSION_NUM < 140000
+#error "PostgreSQL version 14 or higher is required"
 #endif
 
 #include "access/heaptoast.h"
