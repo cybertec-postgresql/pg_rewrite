@@ -1,3 +1,10 @@
+Release 2.2
+===========
+
+This release only adjusts the code so it is compatible with PostgreSQL server
+version 19.
+
+
 Release 2.1
 ===========
 

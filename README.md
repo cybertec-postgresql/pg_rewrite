@@ -55,9 +55,14 @@ make install
 Add these to `postgresql.conf`:
 
 ```
-wal_level = logical
 max_replication_slots = 1 # ... or add 1 to the current value.
 shared_preload_libraries = 'pg_rewrite' # ... or add the library to the existing ones.
+```
+
+If the PostgreSQL server version is lower than 19, also set this one:
+
+```
+wal_level = logical
 ```
 
 Restart the cluster, and invoke:

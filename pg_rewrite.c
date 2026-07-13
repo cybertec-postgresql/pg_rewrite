@@ -77,7 +77,7 @@
 #include "utils/varlena.h"
 
 #ifdef PG_MODULE_MAGIC_EXT
-PG_MODULE_MAGIC_EXT(.name = "pg_rewrite", .version = "2.1");
+PG_MODULE_MAGIC_EXT(.name = "pg_rewrite", .version = "2.2");
 #else
 PG_MODULE_MAGIC;
 #endif
