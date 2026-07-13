@@ -3,7 +3,7 @@
  * pg_rewrite.c
  *     Tools for maintenance that requires table rewriting.
  *
- * Copyright (c) 2021-2025, Cybertec PostgreSQL International GmbH
+ * Copyright (c) 2021-2026, Cybertec PostgreSQL International GmbH
  *
  *----------------------------------------------------------------
  */
@@ -828,8 +828,13 @@ rewrite_worker_main(Datum main_arg)
 		 * do it here.  The insertion into the ReplicationOriginRelationId
 		 * catalog will be rolled back due to the transaction abort.
 		 */
+#if PG_VERSION_NUM >= 190000
+		if (replorigin_xact_state.origin != InvalidReplOriginId)
+			replorigin_xact_state.origin = InvalidReplOriginId;
+#else
 		if (replorigin_session_origin != InvalidRepOriginId)
 			replorigin_session_origin = InvalidRepOriginId;
+#endif
 
 		AbortOutOfAnyTransaction();
 
@@ -867,8 +872,13 @@ pg_rewrite_exit_if_requested(void)
 	 * The insertion into the ReplicationOriginRelationId catalog will be
 	 * rolled back due to the transaction abort.
 	 */
+#if PG_VERSION_NUM >= 190000
+	if (replorigin_xact_state.origin != InvalidReplOriginId)
+		replorigin_xact_state.origin = InvalidReplOriginId;
+#else
 	if (replorigin_session_origin != InvalidRepOriginId)
 		replorigin_session_origin = InvalidRepOriginId;
+#endif
 
 	/*
 	 * Message similar to that in ProcessInterrupts(), but ERROR is
@@ -1703,7 +1713,11 @@ setup_decoding(Relation rel)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 (errmsg("must be superuser or replication role to use replication slots"))));
 
+#if PG_VERSION_NUM >= 190000
+	CheckLogicalDecodingRequirements(false);
+#else
 	CheckLogicalDecodingRequirements();
+#endif
 
 	/* Make sure there's no conflict with the SPI and its contexts. */
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
@@ -1715,12 +1729,20 @@ setup_decoding(Relation rel)
 	buf = makeStringInfo();
 	appendStringInfoString(buf, REPL_SLOT_BASE_NAME);
 	appendStringInfo(buf, "%u_%u", MyDatabaseId, relid);
-#if PG_VERSION_NUM >= 170000
+#if PG_VERSION_NUM >= 190000
+	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false, false, false,
+						  false);
+#elif PG_VERSION_NUM >= 170000
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false, false, false);
 #elif PG_VERSION_NUM >= 140000
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL, false);
 #else
 	ReplicationSlotCreate(buf->data, true, RS_EPHEMERAL);
+#endif
+
+#if PG_VERSION_NUM >= 190000
+		EnsureLogicalDecodingEnabled();
+		Assert(IsLogicalDecodingEnabled());
 #endif
 
 	/*
@@ -1735,6 +1757,9 @@ setup_decoding(Relation rel)
 	ctx = CreateInitDecodingContext(REPL_PLUGIN_NAME,
 									NIL,
 									true,
+#if PG_VERSION_NUM >= 190000
+									false, /* for_repack */
+#endif
 									InvalidXLogRecPtr,
 									XL_ROUTINE(.page_read = read_local_xlog_page,
 											   .segment_open = wal_segment_open,
@@ -1766,6 +1791,9 @@ setup_decoding(Relation rel)
 	dstate->tupdesc_change = CreateTemplateTupleDesc(1);
 
 	TupleDescInitEntry(dstate->tupdesc_change, 1, NULL, BYTEAOID, -1, 0);
+#if PG_VERSION_NUM >= 190000
+	TupleDescFinalize(dstate->tupdesc_change);
+#endif
 	/* ... as well as the corresponding slot. */
 	dstate->tsslot = MakeSingleTupleTableSlot(dstate->tupdesc_change,
 											  &TTSOpsMinimalTuple);
@@ -1917,19 +1945,36 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 	 * The session origin will be used to mark WAL records produced by the
 	 * load itself so that they are not decoded.
 	 */
+#if PG_VERSION_NUM >= 190000
+	Assert(replorigin_xact_state.origin == InvalidReplOriginId);
+#else
 	Assert(replorigin_session_origin == InvalidRepOriginId);
+#endif
 	snprintf(replorigin_name, sizeof(replorigin_name),
 			 REPLORIGIN_NAME_PATTERN, MyDatabaseId);
+#if PG_VERSION_NUM >= 190000
+	replorigin_xact_state.origin = replorigin_create(replorigin_name);
+#else
 	replorigin_session_origin = replorigin_create(replorigin_name);
+#endif
 
 	/*
 	 * Also remember that the WAL records created during the load should not
 	 * be decoded later.
 	 */
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
+#if PG_VERSION_NUM >= 190000
+	dstate->rorigin = replorigin_xact_state.origin;
+#else
 	dstate->rorigin = replorigin_session_origin;
+#endif
 
+#if PG_VERSION_NUM >= 190000
+	heap_scan = table_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL,
+								SO_NONE);
+#else
 	heap_scan = table_beginscan(rel_src, snap_hist, 0, (ScanKey) NULL);
+#endif
 
 	/* Slot to retrieve data from the source table. */
 	slot_src = table_slot_create(rel_src, NULL);
@@ -2220,6 +2265,14 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 
 			/* Update indexes. */
 			recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 190000
+											rri,
+											estate,
+											0, /* flags */
+											slot_dst,
+											NIL,   /* arbiterIndexes */
+											NULL   /* specConflict */
+#else
 #if PG_VERSION_NUM >= 140000
 											rri,
 #endif
@@ -2234,6 +2287,7 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 #if PG_VERSION_NUM >= 160000
 											, false /* onlySummarizing */
 #endif
+#endif	/* PG_VERSION_NUM >= 190000 */
 				);
 			ExecClearTuple(slot_dst);
 
@@ -2304,7 +2358,11 @@ perform_initial_load(EState *estate, ModifyTableState *mtstate,
 #else
 	replorigin_drop(replorigin_session_origin, false);
 #endif
+#if PG_VERSION_NUM >= 190000
+	replorigin_xact_state.origin = InvalidReplOriginId;
+#else
 	replorigin_session_origin = InvalidRepOriginId;
+#endif
 
 	MemoryContextSwitchTo(old_cxt);
 	MemoryContextDelete(load_cxt);

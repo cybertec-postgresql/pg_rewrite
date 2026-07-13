@@ -89,7 +89,11 @@ static void plugin_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 static void store_change(LogicalDecodingContext *ctx,
 						 ConcurrentChangeKind kind, HeapTuple tuple);
 static HeapTuple get_changed_tuple(ConcurrentChange *change);
+#if PG_VERSION_NUM >= 190000
+static bool plugin_filter(LogicalDecodingContext *ctx, ReplOriginId origin_id);
+#else
 static bool plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id);
+#endif
 
 /*
  * Decode and apply concurrent changes. If there are too many of them, split
@@ -446,6 +450,14 @@ apply_insert(HeapTuple tup, TupleTableSlot *slot,
 #endif
 	/* Update indexes. */
 	recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 190000
+		rri,
+		estate,
+		0, /* flags */
+		slot,
+		NIL,   /* arbiterIndexes */
+		NULL   /* specConflict */
+#else
 #if PG_VERSION_NUM >= 140000
 		rri,
 #endif
@@ -460,6 +472,7 @@ apply_insert(HeapTuple tup, TupleTableSlot *slot,
 #if PG_VERSION_NUM >= 160000
 		, false /* onlySummarizing */
 #endif
+#endif	/* PG_VERSION_NUM >= 190000 */
 		);
 	ExecClearTuple(slot);
 
@@ -565,6 +578,14 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 #endif
 		/* Update indexes. */
 		recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 190000
+			rri,
+			estate,
+			0, /* flags */
+			entry->slot,
+			NIL,   /* arbiterIndexes */
+			NULL   /* specConflict */
+#else
 #if PG_VERSION_NUM >= 140000
 			rri,
 #endif
@@ -579,6 +600,7 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 #if PG_VERSION_NUM >= 160000
 			, false /* onlySummarizing */
 #endif
+#endif	/* PG_VERSION_NUM >= 190000 */
 			);
 		ExecClearTuple(entry->slot);
 
@@ -643,6 +665,10 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 			{
 				TupleTableSlot	*slot;
 				List	   *recheck;
+#if PG_VERSION_NUM >= 190000
+				int		flags = update_indexes == TU_Summarizing ?
+					EIIT_ONLY_SUMMARIZING : 0;
+#endif
 
 				slot = entry ? entry->slot : slot_dst;
 
@@ -654,6 +680,14 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 				 * complexity?
 				 */
 				recheck = ExecInsertIndexTuples(
+#if PG_VERSION_NUM >= 190000
+					rri,
+					estate,
+					flags,
+					slot,
+					NIL,   /* arbiterIndexes */
+					NULL   /* specConflict */
+#else
 #if PG_VERSION_NUM >= 140000
 					rri,
 #endif
@@ -669,6 +703,7 @@ apply_update_or_delete(HeapTuple tup, HeapTuple tup_old,
 					/* onlySummarizing */
 					, update_indexes == TU_Summarizing
 #endif
+#endif	/* PG_VERSION_NUM >= 190000 */
 					);
 				ExecClearTuple(slot);
 				list_free(recheck);
@@ -756,7 +791,12 @@ find_tuple(HeapTuple tup, Relation rel, Relation ident_index, ScanKey key,
 #if PG_VERSION_NUM >= 180000
 						   NULL, /* instrument */
 #endif
-						   nkeys, 0);
+						   nkeys,
+						   0
+#if PG_VERSION_NUM >= 190000
+						   , SO_NONE
+#endif
+		);
 	index_rescan(scan, key, nkeys, NULL, 0);
 
 	/* Use the incoming tuple to finalize the scan key. */
@@ -828,8 +868,6 @@ convert_tuple_for_dest_table(HeapTuple tuple,
 void
 _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
-	AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
-
 	cb->startup_cb = plugin_startup;
 	cb->begin_cb = plugin_begin_txn;
 	cb->change_cb = plugin_change;
@@ -1078,16 +1116,26 @@ get_changed_tuple(ConcurrentChange *change)
  * A filter that recognizes changes produced by the initial load.
  */
 static bool
+#if PG_VERSION_NUM >= 190000
+plugin_filter(LogicalDecodingContext *ctx, ReplOriginId origin_id)
+#else
 plugin_filter(LogicalDecodingContext *ctx, RepOriginId origin_id)
+#endif
 {
 	DecodingOutputState *dstate;
 
 	dstate = (DecodingOutputState *) ctx->output_writer_private;
 
 	/* dstate is not initialized during decoding setup - should it be? */
+#if PG_VERSION_NUM >= 190000
+	if (dstate && dstate->rorigin != InvalidReplOriginId &&
+		origin_id == dstate->rorigin)
+		return true;
+#else
 	if (dstate && dstate->rorigin != InvalidRepOriginId &&
 		origin_id == dstate->rorigin)
 		return true;
+#endif
 
 	return false;
 }
